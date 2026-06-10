@@ -1,0 +1,14 @@
+[package]
+name = "count_deepseek_v4_tokens"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokenizers = "0.21"
+rayon = "1"
+indicatif = "0.17"
+
+arrow = "54"
+parquet = { version = "54", features = ["arrow"] }

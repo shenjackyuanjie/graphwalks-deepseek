@@ -1,0 +1,9 @@
+/target/
+
+# Local benchmark artifacts. Re-download/regenerate with the README commands.
+/dataset/
+/tokenizer/
+
+# Runtime outputs for future eval runs.
+/runs/
+/reports/
