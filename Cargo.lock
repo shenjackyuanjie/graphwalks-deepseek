@@ -610,25 +610,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "count_deepseek_v4_tokens"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "clap",
- "futures",
- "indicatif",
- "parquet",
- "rayon",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tokenizers",
- "tokio",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -977,6 +958,25 @@ dependencies = [
  "r-efi",
  "wasip2",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "graphwalks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "clap",
+ "futures",
+ "indicatif",
+ "parquet",
+ "rayon",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
 ]
 
 [[package]]

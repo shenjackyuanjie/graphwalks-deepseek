@@ -5,10 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use arrow::array::{Array, ListArray, StringArray};
-use arrow::record_batch::RecordBatch;
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use graphwalks::utils;
 use indicatif::{ProgressBar, ProgressStyle};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use regex::Regex;
@@ -190,9 +189,9 @@ fn load_samples(args: &Args) -> Result<Vec<Sample>> {
 
     for batch_result in reader {
         let batch = batch_result?;
-        let prompts = get_string_column(&batch, prompt_idx)?;
-        let problem_types = get_string_column(&batch, problem_type_idx)?;
-        let answer_lists = get_list_column(&batch, answer_idx)?;
+        let prompts = utils::read_string_column(&batch, prompt_idx)?;
+        let problem_types = utils::read_string_column(&batch, problem_type_idx)?;
+        let answer_lists = utils::read_list_column(&batch, answer_idx)?;
 
         for row in 0..batch.num_rows() {
             if let Some(max) = args.max_samples {
@@ -217,44 +216,6 @@ fn load_samples(args: &Args) -> Result<Vec<Sample>> {
     }
 
     Ok(samples)
-}
-
-fn get_string_column<'a>(batch: &'a RecordBatch, idx: usize) -> Result<&'a StringArray> {
-    let col = batch.column(idx);
-    let arr = col
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow!("第 {idx} 列不是 Utf8 类型"))?;
-    Ok(arr)
-}
-
-fn get_list_column(batch: &RecordBatch, idx: usize) -> Result<Vec<Vec<String>>> {
-    let col = batch.column(idx);
-    let list_arr = col
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| anyhow!("第 {idx} 列不是 List 类型"))?;
-
-    let values_arr = list_arr.values();
-    let values_str = values_arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow!("List 的值不是 Utf8 类型"))?;
-
-    let mut result = Vec::with_capacity(list_arr.len());
-    for i in 0..list_arr.len() {
-        if list_arr.is_null(i) {
-            result.push(Vec::new());
-        } else {
-            let start = list_arr.value_offsets()[i] as usize;
-            let end = list_arr.value_offsets()[i + 1] as usize;
-            let items: Vec<String> = (start..end)
-                .map(|j| values_str.value(j).to_owned())
-                .collect();
-            result.push(items);
-        }
-    }
-    Ok(result)
 }
 
 // ── 评估单条样本 ──────────────────────────────────────────────────────────
@@ -284,8 +245,8 @@ async fn eval_one(
         }
     };
 
-    let predicted = extract_final_answer(extract_re, &response);
-    let (recall, precision, f1) = score(&predicted, &sample.ground_truth);
+    let predicted = utils::extract_final_answer(extract_re, &response);
+    let (recall, precision, f1) = utils::score(&predicted, &sample.ground_truth);
 
     EvalResult {
         index: sample.index,
@@ -342,57 +303,6 @@ async fn call_api(
         .unwrap_or_default();
 
     Ok(content)
-}
-
-// ── 提取最终答案 ──────────────────────────────────────────────────────────
-
-fn extract_final_answer(re: &Regex, response: &str) -> HashSet<String> {
-    let line = response.lines().last().unwrap_or("");
-    if !line.contains("Final Answer:") {
-        return HashSet::new();
-    }
-
-    if let Some(caps) = re.captures(line) {
-        let list_str = caps.get(1).map_or("", |m| m.as_str());
-        if list_str.trim().is_empty() {
-            return HashSet::new();
-        }
-        list_str
-            .split(',')
-            .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_owned())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        HashSet::new()
-    }
-}
-
-// ── 评分 ──────────────────────────────────────────────────────────────────
-
-fn score(predicted: &HashSet<String>, ground_truth: &HashSet<String>) -> (f64, f64, f64) {
-    let n_overlap = predicted.intersection(ground_truth).count();
-    let n_pred = predicted.len();
-    let n_truth = ground_truth.len();
-
-    let recall = if n_truth > 0 {
-        n_overlap as f64 / n_truth as f64
-    } else {
-        0.0
-    };
-
-    let precision = if n_pred > 0 {
-        n_overlap as f64 / n_pred as f64
-    } else {
-        0.0
-    };
-
-    let f1 = if recall + precision > 0.0 {
-        2.0 * recall * precision / (recall + precision)
-    } else {
-        0.0
-    };
-
-    (recall, precision, f1)
 }
 
 // ── 输出 CSV ──────────────────────────────────────────────────────────────
