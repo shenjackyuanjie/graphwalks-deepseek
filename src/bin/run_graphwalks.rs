@@ -12,6 +12,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use arrow::array::Array;
 
 // ── 命令行参数 ────────────────────────────────────────────────────────────
 
@@ -80,6 +81,27 @@ struct Message {
 #[derive(Deserialize, Debug)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct Usage {
+    completion_tokens: u32,
+    prompt_tokens: u32,
+    #[serde(default)]
+    prompt_cache_hit_tokens: u32,
+    #[serde(default)]
+    prompt_cache_miss_tokens: u32,
+    total_tokens: u32,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u32,
 }
 
 #[derive(Deserialize, Debug)]
@@ -102,6 +124,8 @@ struct Sample {
     prompt: String,
     ground_truth: HashSet<String>,
     problem_type: String,
+    /// 本地 tokenizer 预计算的输入 token 数（可能不存在）。
+    local_input_tokens: Option<i32>,
 }
 
 // ── 评分结果 ──────────────────────────────────────────────────────────────
@@ -116,6 +140,8 @@ struct EvalResult {
     f1: f64,
     response: String,
     reasoning_content: Option<String>,
+    usage: Option<Usage>,
+    local_input_tokens: Option<i32>,
     error: Option<String>,
 }
 
@@ -204,6 +230,7 @@ fn load_samples(args: &Args) -> Result<Vec<Sample>> {
         .map_err(|_| anyhow!("缺少 'problem_type' 列"))?;
 
     let reader = builder.with_batch_size(32).build()?;
+    let token_idx = schema.index_of("deepseek_v4_input_tokens").ok();
     let mut samples = Vec::new();
 
     for batch_result in reader {
@@ -211,6 +238,11 @@ fn load_samples(args: &Args) -> Result<Vec<Sample>> {
         let prompts = utils::read_string_column(&batch, prompt_idx)?;
         let problem_types = utils::read_string_column(&batch, problem_type_idx)?;
         let answer_lists = utils::read_list_column(&batch, answer_idx)?;
+        let token_col = token_idx.map(|idx| {
+            let col = batch.column(idx);
+            col.as_any().downcast_ref::<arrow::array::Int32Array>()
+                .ok_or_else(|| anyhow!("deepseek_v4_input_tokens 列不是 Int32 类型"))
+        }).transpose()?;
 
         for (row, answer_list) in answer_lists.iter().enumerate() {
             if let Some(max) = args.max_samples {
@@ -225,11 +257,14 @@ fn load_samples(args: &Args) -> Result<Vec<Sample>> {
                 .map(|s| s.to_string())
                 .collect();
 
+            let local_input_tokens = token_col.and_then(|arr| if arr.is_null(row) { None } else { Some(arr.value(row)) });
+
             samples.push(Sample {
                 index: samples.len(),
                 prompt,
                 ground_truth,
                 problem_type,
+                local_input_tokens,
             });
         }
     }
@@ -248,7 +283,7 @@ async fn eval_one(
     extract_re: &Regex,
     sample: &Sample,
 ) -> EvalResult {
-    let (content, reasoning_content) = match call_api(client, base_url, model, api_key, thinking_effort, &sample.prompt).await {
+    let (content, reasoning_content, usage) = match call_api(client, base_url, model, api_key, thinking_effort, &sample.prompt).await {
         Ok(r) => r,
         Err(e) => {
             return EvalResult {
@@ -261,6 +296,8 @@ async fn eval_one(
                 f1: 0.0,
                 response: String::new(),
                 reasoning_content: None,
+                usage: None,
+                local_input_tokens: sample.local_input_tokens,
                 error: Some(format!("{e:#}")),
             };
         }
@@ -279,6 +316,8 @@ async fn eval_one(
         f1,
         response: content,
         reasoning_content,
+        usage,
+        local_input_tokens: sample.local_input_tokens,
         error: None,
     }
 }
@@ -290,7 +329,7 @@ async fn call_api(
     api_key: &str,
     thinking_effort: Option<&str>,
     prompt: &str,
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, Option<String>, Option<Usage>)> {
     let (reasoning_effort, thinking) = thinking_effort.map(|e| {
         (Some(e.to_owned()), Some(Thinking { type_: "enabled".to_owned() }))
     }).unwrap_or((None, None));
@@ -333,6 +372,7 @@ async fn call_api(
     Ok((
         choice.message.content.unwrap_or_default(),
         choice.message.reasoning_content,
+        chat_resp.usage,
     ))
 }
 
@@ -342,7 +382,7 @@ fn write_csv(path: &PathBuf, results: &[EvalResult]) -> Result<()> {
     let mut w = File::create(path)
         .with_context(|| format!("无法创建文件: {}", path.display()))?;
 
-    writeln!(w, "index,problem_type,recall,precision,f1,error,response,reasoning_content,predicted,ground_truth")?;
+    writeln!(w, "index,problem_type,recall,precision,f1,error,response,reasoning_content,predicted,ground_truth,api_prompt_tokens,api_completion_tokens,api_total_tokens,api_cache_hit_tokens,api_cache_miss_tokens,api_reasoning_tokens,local_input_tokens")?;
 
     for r in results {
         let predicted = r.predicted.join(";");
@@ -351,9 +391,10 @@ fn write_csv(path: &PathBuf, results: &[EvalResult]) -> Result<()> {
         let error = r.error.as_deref().unwrap_or("");
         let response = csv_escape(&r.response);
         let reasoning = r.reasoning_content.as_deref().map(csv_escape).unwrap_or_default();
+        let u = r.usage.as_ref();
         writeln!(
             w,
-            "{},{},{:.4},{:.4},{:.4},{},{},{},{},{}",
+            "{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{}",
             r.index,
             r.problem_type,
             r.recall,
@@ -363,7 +404,14 @@ fn write_csv(path: &PathBuf, results: &[EvalResult]) -> Result<()> {
             response,
             reasoning,
             predicted,
-            truth
+            truth,
+            u.map_or(0, |u| u.prompt_tokens),
+            u.map_or(0, |u| u.completion_tokens),
+            u.map_or(0, |u| u.total_tokens),
+            u.map_or(0, |u| u.prompt_cache_hit_tokens),
+            u.map_or(0, |u| u.prompt_cache_miss_tokens),
+            u.and_then(|u| u.completion_tokens_details.as_ref()).map_or(0, |d| d.reasoning_tokens),
+            r.local_input_tokens.unwrap_or(-1),
         )?;
     }
 
