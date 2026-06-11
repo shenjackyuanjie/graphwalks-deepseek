@@ -193,7 +193,7 @@ fn load_samples(args: &Args) -> Result<Vec<Sample>> {
         let problem_types = utils::read_string_column(&batch, problem_type_idx)?;
         let answer_lists = utils::read_list_column(&batch, answer_idx)?;
 
-        for row in 0..batch.num_rows() {
+        for (row, answer_list) in answer_lists.iter().enumerate() {
             if let Some(max) = args.max_samples {
                 if samples.len() >= max {
                     return Ok(samples);
@@ -201,7 +201,7 @@ fn load_samples(args: &Args) -> Result<Vec<Sample>> {
             }
             let prompt = prompts.value(row).to_owned();
             let problem_type = problem_types.value(row).to_owned();
-            let ground_truth: HashSet<String> = answer_lists[row]
+            let ground_truth: HashSet<String> = answer_list
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
@@ -311,22 +311,24 @@ fn write_csv(path: &PathBuf, results: &[EvalResult]) -> Result<()> {
     let mut w = File::create(path)
         .with_context(|| format!("无法创建文件: {}", path.display()))?;
 
-    writeln!(w, "index,problem_type,recall,precision,f1,error,predicted,ground_truth")?;
+    writeln!(w, "index,problem_type,recall,precision,f1,error,response,predicted,ground_truth")?;
 
     for r in results {
         let predicted = r.predicted.join(";");
         let truth: Vec<String> = r.ground_truth.iter().cloned().collect();
         let truth = truth.join(";");
         let error = r.error.as_deref().unwrap_or("");
+        let response = csv_escape(&r.response);
         writeln!(
             w,
-            "{},{},{:.4},{:.4},{:.4},{},{},{}",
+            "{},{},{:.4},{:.4},{:.4},{},{},{},{}",
             r.index,
             r.problem_type,
             r.recall,
             r.precision,
             r.f1,
             error,
+            response,
             predicted,
             truth
         )?;
@@ -334,6 +336,12 @@ fn write_csv(path: &PathBuf, results: &[EvalResult]) -> Result<()> {
 
     w.flush()?;
     Ok(())
+}
+
+/// 简单的 CSV 字段转义：用双引号包裹，内部换行替换为空格。
+fn csv_escape(s: &str) -> String {
+    let escaped = s.replace('\n', " ").replace('"', "\"\"");
+    format!("\"{}\"", escaped)
 }
 
 // ── 汇总报告 ──────────────────────────────────────────────────────────────

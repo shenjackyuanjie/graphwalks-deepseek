@@ -10,11 +10,11 @@ const TOKEN_COL: &str = "deepseek_v4_input_tokens";
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// Rows per parquet batch.
+    /// 每个 parquet batch 的行数。
     #[arg(long, default_value_t = 1024)]
     batch_size: usize,
 
-    /// Input parquet files with deepseek_v4_input_tokens.
+    /// 输入的 parquet 文件（须包含 deepseek_v4_input_tokens 列）。
     #[arg(required = true)]
     inputs: Vec<PathBuf>,
 }
@@ -51,11 +51,11 @@ fn main() -> Result<()> {
         per_file.push((input.clone(), stats));
     }
 
-    println!("# DeepSeek V4 Token Count Distribution\n");
-    println!("Column: `{TOKEN_COL}`");
-    println!("Buckets are `[lower, upper)` except the final bucket.\n");
+    println!("# DeepSeek V4 Token 数分布\n");
+    println!("统计列: `{TOKEN_COL}`");
+    println!("区间为 `[下限, 上限)`，最后一个区间除外。\n");
 
-    print_table("All files", &all, &buckets);
+    print_table("全部文件", &all, &buckets);
     for (path, stats) in per_file {
         println!();
         print_table(&path.to_string_lossy(), &stats, &buckets);
@@ -116,13 +116,13 @@ fn buckets() -> Vec<Bucket> {
 
 fn read_stats(path: &Path, batch_size: usize, buckets: &[Bucket]) -> Result<Stats> {
     let file = File::open(path)
-        .with_context(|| format!("failed to open input parquet: {}", path.display()))?;
+        .with_context(|| format!("无法打开输入 parquet: {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .with_context(|| format!("failed to create parquet reader: {}", path.display()))?;
+        .with_context(|| format!("无法创建 parquet reader: {}", path.display()))?;
     let reader = builder
         .with_batch_size(batch_size)
         .build()
-        .with_context(|| format!("failed to build parquet reader: {}", path.display()))?;
+        .with_context(|| format!("无法构建 parquet reader: {}", path.display()))?;
 
     let mut stats = Stats {
         bucket_counts: vec![0; buckets.len()],
@@ -130,16 +130,16 @@ fn read_stats(path: &Path, batch_size: usize, buckets: &[Bucket]) -> Result<Stat
     };
 
     for batch in reader {
-        let batch = batch.with_context(|| "failed to read parquet batch")?;
+        let batch = batch.with_context(|| "读取 parquet batch 失败")?;
         let idx = batch
             .schema()
             .index_of(TOKEN_COL)
-            .with_context(|| format!("column {TOKEN_COL:?} not found"))?;
+            .with_context(|| format!("找不到列 {TOKEN_COL:?}"))?;
         let arr = batch
             .column(idx)
             .as_any()
             .downcast_ref::<Int32Array>()
-            .ok_or_else(|| anyhow!("column {TOKEN_COL:?} is not Int32"))?;
+            .ok_or_else(|| anyhow!("列 {TOKEN_COL:?} 不是 Int32 类型"))?;
 
         for i in 0..arr.len() {
             if arr.is_null(i) {
@@ -165,7 +165,7 @@ fn update_stats(stats: &mut Stats, tokens: i32, buckets: &[Bucket]) {
     for (idx, bucket) in buckets.iter().enumerate() {
         let below_max = bucket
             .max_exclusive
-            .map_or(true, |max_exclusive| tokens < max_exclusive);
+            .is_none_or(|max_exclusive| tokens < max_exclusive);
         if tokens >= bucket.min_inclusive && below_max {
             stats.bucket_counts[idx] += 1;
             return;
@@ -199,7 +199,7 @@ fn merge_stats(dst: &mut Stats, src: &Stats) {
 fn print_table(title: &str, stats: &Stats, buckets: &[Bucket]) {
     println!("## {title}\n");
     println!(
-        "Rows: {} | Min: {} | Max: {} | Mean: {:.1} | >1M: {}",
+        "行数: {} | 最小值: {} | 最大值: {} | 均值: {:.1} | >1M: {}",
         stats.total,
         stats.min_tokens.unwrap_or_default(),
         stats.max_tokens.unwrap_or_default(),
@@ -207,7 +207,7 @@ fn print_table(title: &str, stats: &Stats, buckets: &[Bucket]) {
         stats.over_1m
     );
     println!();
-    println!("| Token bucket | Rows | Percent |");
+    println!("| Token 区间 | 行数 | 占比 |");
     println!("|---|---:|---:|");
     for (bucket, count) in buckets.iter().zip(&stats.bucket_counts) {
         println!(

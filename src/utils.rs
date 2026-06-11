@@ -12,7 +12,7 @@ use regex::Regex;
 // ── parquet 列读取 ────────────────────────────────────────────────────────
 
 /// 从 RecordBatch 中读取 Utf8 字符串列。
-pub fn read_string_column<'a>(batch: &'a RecordBatch, idx: usize) -> Result<&'a StringArray> {
+pub fn read_string_column(batch: &RecordBatch, idx: usize) -> Result<&StringArray> {
     let col = batch.column(idx);
     col
         .as_any()

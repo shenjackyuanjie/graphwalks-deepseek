@@ -20,19 +20,19 @@ const OVER_1M_COL: &str = "deepseek_v4_over_1m";
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// Path to DeepSeek V4 tokenizer.json.
+    /// DeepSeek V4 tokenizer.json 路径。
     #[arg(long, default_value = "tokenizer/deepseek-v4-pro/tokenizer.json")]
     tokenizer_json: PathBuf,
 
-    /// Text column to count. GraphWalks uses prompt.
+    /// 要统计 token 数的文本列名。GraphWalks 数据集用 prompt。
     #[arg(long, default_value = "prompt")]
     text_col: String,
 
-    /// Rows per parquet batch. Long-context rows can be very large.
+    /// 每个 parquet batch 的行数。长上下文行可能很大，建议用小值。
     #[arg(long, default_value_t = 32)]
     batch_size: usize,
 
-    /// Input parquet files.
+    /// 输入的 parquet 文件。
     #[arg(required = true)]
     inputs: Vec<PathBuf>,
 }
@@ -41,7 +41,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let tokenizer = Tokenizer::from_file(&args.tokenizer_json)
-        .map_err(|e| anyhow!("failed to load tokenizer {:?}: {e}", args.tokenizer_json))?;
+        .map_err(|e| anyhow!("加载 tokenizer 失败 {:?}: {e}", args.tokenizer_json))?;
     let tokenizer = Arc::new(tokenizer);
 
     for input in &args.inputs {
@@ -58,16 +58,16 @@ fn process_file(
     batch_size: usize,
 ) -> Result<()> {
     let input_file = File::open(input_path)
-        .with_context(|| format!("failed to open input parquet: {}", input_path.display()))?;
+        .with_context(|| format!("无法打开输入 parquet: {}", input_path.display()))?;
 
     let builder = ParquetRecordBatchReaderBuilder::try_new(input_file)
-        .with_context(|| format!("failed to create parquet reader: {}", input_path.display()))?;
+        .with_context(|| format!("无法创建 parquet reader: {}", input_path.display()))?;
 
     let input_schema = builder.schema().clone();
     if input_schema.index_of(TOKEN_COUNT_COL).is_ok() || input_schema.index_of(OVER_1M_COL).is_ok()
     {
         return Err(anyhow!(
-            "input already contains {TOKEN_COUNT_COL:?} or {OVER_1M_COL:?}: {}",
+            "输入文件已包含 {TOKEN_COUNT_COL:?} 或 {OVER_1M_COL:?} 列: {}",
             input_path.display()
         ));
     }
@@ -76,11 +76,11 @@ fn process_file(
     let reader = builder
         .with_batch_size(batch_size)
         .build()
-        .with_context(|| format!("failed to build parquet reader: {}", input_path.display()))?;
+        .with_context(|| format!("无法构建 parquet reader: {}", input_path.display()))?;
 
     let output_path = output_path_for(input_path);
     let output_file = File::create(&output_path)
-        .with_context(|| format!("failed to create output parquet: {}", output_path.display()))?;
+        .with_context(|| format!("无法创建输出 parquet: {}", output_path.display()))?;
 
     let pb = ProgressBar::new(total_rows);
     pb.set_style(
@@ -101,7 +101,7 @@ fn process_file(
     let mut writer: Option<ArrowWriter<File>> = None;
 
     for batch_result in reader {
-        let batch = batch_result.with_context(|| "failed to read parquet batch")?;
+        let batch = batch_result.with_context(|| "读取 parquet batch 失败")?;
 
         let texts: Vec<String> = {
             let text_array = get_text_array(&batch, text_col)?;
@@ -132,7 +132,7 @@ fn process_file(
         if writer.is_none() {
             writer = Some(
                 ArrowWriter::try_new(output_file.try_clone()?, new_batch.schema(), None)
-                    .with_context(|| "failed to create parquet writer")?,
+                    .with_context(|| "无法创建 parquet writer")?,
             );
         }
 
@@ -140,7 +140,7 @@ fn process_file(
             .as_mut()
             .unwrap()
             .write(&new_batch)
-            .with_context(|| "failed to write parquet batch")?;
+            .with_context(|| "写入 parquet batch 失败")?;
 
         pb.inc(new_batch.num_rows() as u64);
     }
@@ -148,10 +148,10 @@ fn process_file(
     if let Some(writer) = writer {
         writer
             .close()
-            .with_context(|| "failed to close parquet writer")?;
+            .with_context(|| "关闭 parquet writer 失败")?;
     }
 
-    pb.finish_with_message(format!("wrote {}", output_path.display()));
+    pb.finish_with_message(format!("已写入 {}", output_path.display()));
     Ok(())
 }
 
@@ -164,7 +164,7 @@ fn get_text_array<'a>(batch: &'a RecordBatch, text_col: &str) -> Result<Box<dyn 
     let idx = batch
         .schema()
         .index_of(text_col)
-        .with_context(|| format!("column {text_col:?} not found"))?;
+        .with_context(|| format!("找不到列 {text_col:?}"))?;
 
     let col = batch.column(idx);
 
@@ -173,18 +173,18 @@ fn get_text_array<'a>(batch: &'a RecordBatch, text_col: &str) -> Result<Box<dyn 
             let arr = col
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| anyhow!("failed to downcast Utf8 column"))?;
+                .ok_or_else(|| anyhow!("Utf8 列类型转换失败"))?;
             Ok(Box::new(Utf8Accessor { arr }))
         }
         DataType::LargeUtf8 => {
             let arr = col
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| anyhow!("failed to downcast LargeUtf8 column"))?;
+                .ok_or_else(|| anyhow!("LargeUtf8 列类型转换失败"))?;
             Ok(Box::new(LargeUtf8Accessor { arr }))
         }
         other => Err(anyhow!(
-            "column {text_col:?} must be Utf8 or LargeUtf8, got {other:?}"
+            "列 {text_col:?} 必须是 Utf8 或 LargeUtf8 类型，实际为 {other:?}"
         )),
     }
 }
@@ -238,7 +238,7 @@ fn append_columns(
 ) -> Result<RecordBatch> {
     if token_counts.len() != batch.num_rows() || over_1m.len() != batch.num_rows() {
         return Err(anyhow!(
-            "new column length mismatch: rows={}, tokens={}, over_1m={}",
+            "新列长度不匹配: 行数={}, tokens={}, over_1m={}",
             batch.num_rows(),
             token_counts.len(),
             over_1m.len()
@@ -261,5 +261,5 @@ fn append_columns(
     columns.push(Arc::new(BooleanArray::from(over_1m)) as ArrayRef);
 
     RecordBatch::try_new(new_schema, columns)
-        .with_context(|| "failed to build output record batch")
+        .with_context(|| "构建输出 RecordBatch 失败")
 }
