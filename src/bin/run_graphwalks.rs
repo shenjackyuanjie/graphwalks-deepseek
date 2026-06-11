@@ -42,6 +42,10 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     concurrency: usize,
 
+    /// 思考强度。传入 high 或 max 开启思考模式，不传则关闭。
+    #[arg(long)]
+    thinking_effort: Option<String>,
+
     /// 输出 CSV 文件，写入每条样本的评分结果。
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -55,6 +59,16 @@ struct ChatRequest {
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Thinking>,
+}
+
+#[derive(Serialize)]
+struct Thinking {
+    #[serde(rename = "type")]
+    type_: String,
 }
 
 #[derive(Serialize)]
@@ -76,6 +90,8 @@ struct Choice {
 #[derive(Deserialize, Debug)]
 struct ChoiceMessage {
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 // ── 样本 ─────────────────────────────────────────────────────────────────
@@ -99,6 +115,7 @@ struct EvalResult {
     precision: f64,
     f1: f64,
     response: String,
+    reasoning_content: Option<String>,
     error: Option<String>,
 }
 
@@ -132,7 +149,8 @@ async fn main() -> Result<()> {
     );
 
     let concurrency = args.concurrency;
-    let extract_re = Arc::new(Regex::new(r"Final Answer: ?\[(.*?)\]").unwrap());
+    let thinking_effort = Arc::new(args.thinking_effort);
+    let extract_re = Arc::new(Regex::new("Final Answer: ?\\[(.*?)\\]").unwrap());
 
     let results: Vec<EvalResult> = stream::iter(samples.into_iter().map(|sample| {
         let client = client.clone();
@@ -140,9 +158,10 @@ async fn main() -> Result<()> {
         let model = model.clone();
         let api_key = api_key.clone();
         let pb = pb.clone();
+        let thinking_effort = thinking_effort.clone();
         let extract_re = extract_re.clone();
         async move {
-            let result = eval_one(&client, &base_url, &model, &api_key, &extract_re, &sample).await;
+            let result = eval_one(&client, &base_url, &model, &api_key, thinking_effort.as_deref(), &extract_re, &sample).await;
             pb.inc(1);
             pb.set_message(format!("#{}", sample.index));
             result
@@ -225,11 +244,12 @@ async fn eval_one(
     base_url: &str,
     model: &str,
     api_key: &str,
+    thinking_effort: Option<&str>,
     extract_re: &Regex,
     sample: &Sample,
 ) -> EvalResult {
-    let response = match call_api(client, base_url, model, api_key, &sample.prompt).await {
-        Ok(content) => content,
+    let (content, reasoning_content) = match call_api(client, base_url, model, api_key, thinking_effort, &sample.prompt).await {
+        Ok(r) => r,
         Err(e) => {
             return EvalResult {
                 index: sample.index,
@@ -240,12 +260,13 @@ async fn eval_one(
                 precision: 0.0,
                 f1: 0.0,
                 response: String::new(),
+                reasoning_content: None,
                 error: Some(format!("{e:#}")),
             };
         }
     };
 
-    let predicted = utils::extract_final_answer(extract_re, &response);
+    let predicted = utils::extract_final_answer(extract_re, &content);
     let (recall, precision, f1) = utils::score(&predicted, &sample.ground_truth);
 
     EvalResult {
@@ -256,7 +277,8 @@ async fn eval_one(
         recall,
         precision,
         f1,
-        response,
+        response: content,
+        reasoning_content,
         error: None,
     }
 }
@@ -266,8 +288,13 @@ async fn call_api(
     base_url: &str,
     model: &str,
     api_key: &str,
+    thinking_effort: Option<&str>,
     prompt: &str,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
+    let (reasoning_effort, thinking) = thinking_effort.map(|e| {
+        (Some(e.to_owned()), Some(Thinking { type_: "enabled".to_owned() }))
+    }).unwrap_or((None, None));
+
     let req_body = ChatRequest {
         model: model.to_owned(),
         messages: vec![Message {
@@ -275,6 +302,8 @@ async fn call_api(
             content: prompt.to_owned(),
         }],
         temperature: Some(0.0),
+        reasoning_effort,
+        thinking,
     };
 
     let resp = client
@@ -295,14 +324,16 @@ async fn call_api(
     let chat_resp: ChatResponse =
         serde_json::from_str(&body_text).context("解析 API 响应失败")?;
 
-    let content = chat_resp
+    let choice = chat_resp
         .choices
         .into_iter()
         .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
+        .unwrap_or_else(|| panic!("API 返回了空的 choices"));
 
-    Ok(content)
+    Ok((
+        choice.message.content.unwrap_or_default(),
+        choice.message.reasoning_content,
+    ))
 }
 
 // ── 输出 CSV ──────────────────────────────────────────────────────────────
@@ -311,7 +342,7 @@ fn write_csv(path: &PathBuf, results: &[EvalResult]) -> Result<()> {
     let mut w = File::create(path)
         .with_context(|| format!("无法创建文件: {}", path.display()))?;
 
-    writeln!(w, "index,problem_type,recall,precision,f1,error,response,predicted,ground_truth")?;
+    writeln!(w, "index,problem_type,recall,precision,f1,error,response,reasoning_content,predicted,ground_truth")?;
 
     for r in results {
         let predicted = r.predicted.join(";");
@@ -319,9 +350,10 @@ fn write_csv(path: &PathBuf, results: &[EvalResult]) -> Result<()> {
         let truth = truth.join(";");
         let error = r.error.as_deref().unwrap_or("");
         let response = csv_escape(&r.response);
+        let reasoning = r.reasoning_content.as_deref().map(csv_escape).unwrap_or_default();
         writeln!(
             w,
-            "{},{},{:.4},{:.4},{:.4},{},{},{},{}",
+            "{},{},{:.4},{:.4},{:.4},{},{},{},{},{}",
             r.index,
             r.problem_type,
             r.recall,
@@ -329,6 +361,7 @@ fn write_csv(path: &PathBuf, results: &[EvalResult]) -> Result<()> {
             r.f1,
             error,
             response,
+            reasoning,
             predicted,
             truth
         )?;
