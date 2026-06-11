@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
-use graphwalks::utils;
+use deepseek_graphwalks::utils;
 use indicatif::{ProgressBar, ProgressStyle};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use regex::Regex;

@@ -715,6 +715,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepseek-graphwalks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "clap",
+ "futures",
+ "indicatif",
+ "parquet",
+ "rayon",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
+]
+
+[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -958,25 +977,6 @@ dependencies = [
  "r-efi",
  "wasip2",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "graphwalks"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "clap",
- "futures",
- "indicatif",
- "parquet",
- "rayon",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tokenizers",
- "tokio",
 ]
 
 [[package]]
