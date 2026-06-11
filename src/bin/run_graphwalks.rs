@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -53,18 +53,23 @@ struct Args {
 
 // 实时统计
 
-/// 滑动窗口时长（用于 streaming chars/s）。
 const WINDOW: Duration = Duration::from_secs(5);
+
+/// 每个活跃请求的 streaming 状态。
+#[derive(Clone)]
+struct ActiveInfo {
+    chars: u64,
+    chars_per_sec: u64,
+    /// 最近 delta 的时间戳（用于滑动窗口）。
+    ticks: VecDeque<(Instant, usize)>,
+}
 
 struct LiveStats {
     completed: AtomicUsize,
     total_prompt_tokens: AtomicU64,
     total_completion_tokens: AtomicU64,
-    /// 累计 streaming 字符数（content + reasoning）。
-    stream_chars: AtomicU64,
-    /// streaming 字符增量事件 (时间, 增量字符数)。
-    stream_ticks: Mutex<VecDeque<(Instant, usize)>>,
-    /// 最后一个完成的样本标签。
+    /// sample_index -> 活跃 streaming 状态。
+    active: Mutex<HashMap<usize, ActiveInfo>>,
     last_done: Mutex<Option<String>>,
 }
 
@@ -74,8 +79,7 @@ impl LiveStats {
             completed: AtomicUsize::new(0),
             total_prompt_tokens: AtomicU64::new(0),
             total_completion_tokens: AtomicU64::new(0),
-            stream_chars: AtomicU64::new(0),
-            stream_ticks: Mutex::new(VecDeque::new()),
+            active: Mutex::new(HashMap::new()),
             last_done: Mutex::new(None),
         }
     }
@@ -85,15 +89,30 @@ impl LiveStats {
         if delta == 0 {
             return;
         }
-        self.stream_chars.fetch_add(delta as u64, Ordering::Relaxed);
-        let mut ticks = self.stream_ticks.lock().unwrap();
-        ticks.push_back((now, delta));
-        while ticks
-            .front()
-            .map_or(false, |(t, _)| now - *t > WINDOW)
-        {
-            ticks.pop_front();
+        let mut active = self.active.lock().unwrap();
+        let info = active.entry(tick.sample_index).or_insert_with(|| ActiveInfo {
+            chars: 0,
+            chars_per_sec: 0,
+            ticks: VecDeque::new(),
+        });
+        info.chars += delta as u64;
+        info.ticks.push_back((now, delta));
+        // 清理 5s 外的旧 tick
+        while info.ticks.front().map_or(false, |(t, _)| now - *t > WINDOW) {
+            info.ticks.pop_front();
         }
+        if info.ticks.len() >= 2 {
+            let first_time = info.ticks.front().unwrap().0;
+            let window_chars: usize = info.ticks.iter().map(|(_, n)| n).sum();
+            let duration = (now - first_time).as_secs_f64();
+            if duration > 0.3 {
+                info.chars_per_sec = (window_chars as f64 / duration) as u64;
+            }
+        }
+    }
+
+    fn finish_request(&self, sample_index: usize) {
+        self.active.lock().unwrap().remove(&sample_index);
     }
 
     fn record_done(&self, prompt_tokens: u64, completion_tokens: u64, label: String) {
@@ -106,7 +125,6 @@ impl LiveStats {
     }
 
     fn progress_msg(&self) -> String {
-        let now = Instant::now();
         let completed = self.completed.load(Ordering::Relaxed);
         let prompt = self.total_prompt_tokens.load(Ordering::Relaxed);
         let completion = self.total_completion_tokens.load(Ordering::Relaxed);
@@ -118,12 +136,20 @@ impl LiveStats {
             0
         };
 
-        let (stream_chars, chars_per_sec) = self.stream_speed(now);
-
         let mut parts = vec![format!("total:{total_tokens} avg:{avg_tokens}/s")];
 
-        if stream_chars > 0 {
-            parts.push(format!("out:{stream_chars}c {chars_per_sec}c/s"));
+        // 活跃请求状态
+        let active = self.active.lock().unwrap();
+        if !active.is_empty() {
+            let mut items: Vec<(usize, String)> = active
+                .iter()
+                .map(|(idx, info)| {
+                    (*idx, format!("#{idx}->{chars}c {cps}c/s", chars = info.chars, cps = info.chars_per_sec))
+                })
+                .collect();
+            items.sort_by_key(|(idx, _)| *idx);
+            let labels: Vec<_> = items.into_iter().map(|(_, s)| s).collect();
+            parts.push(format!("[{}]", labels.join(" ")));
         }
 
         if let Some(ref last) = *self.last_done.lock().unwrap() {
@@ -131,29 +157,6 @@ impl LiveStats {
         }
 
         parts.join(" ")
-    }
-
-    /// 返回 (累计字符数, 窗口内 chars/sec)。
-    fn stream_speed(&self, now: Instant) -> (u64, u64) {
-        let mut ticks = self.stream_ticks.lock().unwrap();
-        while ticks
-            .front()
-            .map_or(false, |(t, _)| now - *t > WINDOW)
-        {
-            ticks.pop_front();
-        }
-        if ticks.len() < 2 {
-            return (0, 0);
-        }
-        let first_time = ticks.front().unwrap().0;
-        let window_chars: usize = ticks.iter().map(|(_, n)| n).sum();
-        let duration = (now - first_time).as_secs_f64();
-        if duration > 0.3 {
-            let chars_per_sec = window_chars as f64 / duration;
-            (self.stream_chars.load(Ordering::Relaxed), chars_per_sec as u64)
-        } else {
-            (0, 0)
-        }
     }
 }
 
@@ -253,6 +256,9 @@ async fn main() -> Result<()> {
             )
             .await;
             let elapsed = t0.elapsed();
+
+            // 从活跃列表中移除
+            stats.finish_request(sample.index);
 
             let prompt_tokens = result
                 .usage
