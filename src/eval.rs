@@ -191,48 +191,60 @@ async fn eval_one_inner(
 
 // ── 输出 CSV ──────────────────────────────────────────────────────────────
 
+/// CSV 表头。
+pub const CSV_HEADER: &str = "index,problem_type,recall,precision,f1,error,response,reasoning_content,predicted,ground_truth,api_prompt_tokens,api_completion_tokens,api_total_tokens,api_cache_hit_tokens,api_cache_miss_tokens,api_reasoning_tokens,local_input_tokens";
+
+/// 写入 CSV 表头。
+pub fn write_csv_header(w: &mut impl Write) -> std::io::Result<()> {
+    writeln!(w, "{CSV_HEADER}")
+}
+
+/// 写入单行 CSV。
+pub fn write_csv_row(w: &mut impl Write, r: &EvalResult) -> std::io::Result<()> {
+    let predicted = r.predicted.join(";");
+    let truth: Vec<String> = r.ground_truth.iter().cloned().collect();
+    let truth = truth.join(";");
+    let error = r.error.as_deref().unwrap_or("");
+    let response = csv_escape(&r.response);
+    let reasoning = r
+        .reasoning_content
+        .as_deref()
+        .map(csv_escape)
+        .unwrap_or_default();
+    let u = r.usage.as_ref();
+    writeln!(
+        w,
+        "{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{}",
+        r.index,
+        r.problem_type,
+        r.recall,
+        r.precision,
+        r.f1,
+        error,
+        response,
+        reasoning,
+        predicted,
+        truth,
+        u.map_or(0, |u| u.prompt_tokens),
+        u.map_or(0, |u| u.completion_tokens),
+        u.map_or(0, |u| u.total_tokens),
+        u.map_or(0, |u| u.prompt_cache_hit_tokens),
+        u.map_or(0, |u| u.prompt_cache_miss_tokens),
+        u.and_then(|u| u.completion_tokens_details.as_ref())
+            .map_or(0, |d| d.reasoning_tokens),
+        r.local_input_tokens.unwrap_or(-1),
+    )
+}
+
+/// 批量写入 CSV（保留旧接口）。
 pub fn write_csv(path: &Path, results: &[EvalResult]) -> Result<()> {
     let mut w = File::create(path)
         .with_context(|| format!("无法创建文件: {}", path.display()))?;
 
-    writeln!(w, "index,problem_type,recall,precision,f1,error,response,reasoning_content,predicted,ground_truth,api_prompt_tokens,api_completion_tokens,api_total_tokens,api_cache_hit_tokens,api_cache_miss_tokens,api_reasoning_tokens,local_input_tokens")?;
-
+    write_csv_header(&mut w)?;
     for r in results {
-        let predicted = r.predicted.join(";");
-        let truth: Vec<String> = r.ground_truth.iter().cloned().collect();
-        let truth = truth.join(";");
-        let error = r.error.as_deref().unwrap_or("");
-        let response = csv_escape(&r.response);
-        let reasoning = r
-            .reasoning_content
-            .as_deref()
-            .map(csv_escape)
-            .unwrap_or_default();
-        let u = r.usage.as_ref();
-        writeln!(
-            w,
-            "{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{}",
-            r.index,
-            r.problem_type,
-            r.recall,
-            r.precision,
-            r.f1,
-            error,
-            response,
-            reasoning,
-            predicted,
-            truth,
-            u.map_or(0, |u| u.prompt_tokens),
-            u.map_or(0, |u| u.completion_tokens),
-            u.map_or(0, |u| u.total_tokens),
-            u.map_or(0, |u| u.prompt_cache_hit_tokens),
-            u.map_or(0, |u| u.prompt_cache_miss_tokens),
-            u.and_then(|u| u.completion_tokens_details.as_ref())
-                .map_or(0, |d| d.reasoning_tokens),
-            r.local_input_tokens.unwrap_or(-1),
-        )?;
+        write_csv_row(&mut w, r)?;
     }
-
     w.flush()?;
     Ok(())
 }

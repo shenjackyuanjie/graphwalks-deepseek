@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,6 +11,7 @@ use chrono::Local;
 use clap::Parser;
 use deepseek_graphwalks::api::{ApiConfig, StreamTick};
 use deepseek_graphwalks::eval;
+use deepseek_graphwalks::eval::EvalResult;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
@@ -237,11 +239,36 @@ async fn main() -> Result<()> {
         let _ = std::io::stderr().flush();
     });
 
+    // 确保输出目录存在并创建 CSV 文件，提前写入表头
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建目录: {}", parent.display()))?;
+    }
+    let mut csv_file = BufWriter::new(
+        File::create(&output)
+            .with_context(|| format!("无法创建文件: {}", output.display()))?,
+    );
+    eval::write_csv_header(&mut csv_file)?;
+
+    // CSV 逐行写入 channel：每完成一个样本就写入一行
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<EvalResult>();
+
+    // 后台阻塞任务：负责追加写入 CSV 并收集所有结果
+    let write_handle = tokio::task::spawn_blocking(move || -> Result<Vec<EvalResult>> {
+        let mut results = Vec::new();
+        while let Some(result) = write_rx.blocking_recv() {
+            eval::write_csv_row(&mut csv_file, &result)?;
+            results.push(result);
+        }
+        csv_file.flush()?;
+        Ok(results)
+    });
+
     let concurrency = args.concurrency;
     let thinking_effort = Arc::new(args.thinking_effort);
     let extract_re = Arc::new(Regex::new("Final Answer: ?\\[(.*?)\\]").unwrap());
 
-    let results: Vec<eval::EvalResult> = stream::iter(samples.into_iter().map(|sample| {
+    let _: Vec<()> = stream::iter(samples.into_iter().map(|sample| {
         let client = client.clone();
         let base_url = base_url.clone();
         let model = model.clone();
@@ -251,6 +278,7 @@ async fn main() -> Result<()> {
         let thinking_effort = thinking_effort.clone();
         let extract_re = extract_re.clone();
         let tick_tx = tick_tx.clone();
+        let write_tx = write_tx.clone();
         async move {
             let cfg = ApiConfig {
                 client: &client,
@@ -330,25 +358,23 @@ async fn main() -> Result<()> {
             };
             pb.println(msg);
 
-            result
+            // 通过 channel 发送结果，由后台任务实时写入 CSV
+            let _ = write_tx.send(result);
         }
     }))
     .buffer_unordered(concurrency)
     .collect()
     .await;
 
-    // drop tick_tx 以关闭后台任务
+    // drop tick_tx 以关闭后台刷新任务
     drop(tick_tx);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     pb.finish_and_clear();
 
-    // 确保输出目录存在
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("无法创建目录: {}", parent.display()))?;
-    }
-    eval::write_csv(&output, &results)?;
+    // drop write_tx，通知后台写入任务所有结果已发送完毕
+    drop(write_tx);
+    let results = write_handle.await??;
     println!("结果已写入 {}", output.display());
 
     eval::print_summary(&results);
