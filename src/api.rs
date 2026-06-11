@@ -85,23 +85,30 @@ pub struct StreamTick {
     pub reasoning_delta_chars: usize,
 }
 
+// ── API 配置 ───────────────────────────────────────────────────────────────
+
+/// 封装调用 DeepSeek API 所需的公共参数。
+pub struct ApiConfig<'a> {
+    pub client: &'a reqwest::Client,
+    pub base_url: &'a str,
+    pub model: &'a str,
+    pub api_key: &'a str,
+}
+
 // ── 非 streaming API 调用 ────────────────────────────────────────────────
 
 /// 调用 DeepSeek Chat Completions API，返回 (content, reasoning_content, usage)。
 pub async fn call_api(
-    client: &reqwest::Client,
-    base_url: &str,
-    model: &str,
-    api_key: &str,
+    cfg: &ApiConfig<'_>,
     thinking_effort: Option<&str>,
     prompt: &str,
 ) -> Result<(String, Option<String>, Option<Usage>)> {
     let (reasoning_effort, thinking) = build_thinking(thinking_effort);
-    let req_body = build_request(model, prompt, reasoning_effort, thinking, false);
+    let req_body = build_request(cfg.model, prompt, reasoning_effort, thinking, false);
 
-    let resp = client
-        .post(format!("{base_url}/chat/completions"))
-        .header("Authorization", format!("Bearer {api_key}"))
+    let resp = cfg.client
+        .post(format!("{}/chat/completions", cfg.base_url))
+        .header("Authorization", format!("Bearer {}", cfg.api_key))
         .json(&req_body)
         .send()
         .await
@@ -135,21 +142,18 @@ pub async fn call_api(
 /// 调用 DeepSeek Chat Completions API（streaming 模式），
 /// 每收到一个 delta 就通过 `tick_tx` 发送进度通知。
 pub async fn call_api_streaming(
-    client: &reqwest::Client,
-    base_url: &str,
-    model: &str,
-    api_key: &str,
+    cfg: &ApiConfig<'_>,
     thinking_effort: Option<&str>,
     prompt: &str,
     sample_index: usize,
     tick_tx: &mpsc::UnboundedSender<StreamTick>,
 ) -> Result<(String, Option<String>, Option<Usage>)> {
     let (reasoning_effort, thinking) = build_thinking(thinking_effort);
-    let req_body = build_request(model, prompt, reasoning_effort, thinking, true);
+    let req_body = build_request(cfg.model, prompt, reasoning_effort, thinking, true);
 
-    let resp = client
-        .post(format!("{base_url}/chat/completions"))
-        .header("Authorization", format!("Bearer {api_key}"))
+    let resp = cfg.client
+        .post(format!("{}/chat/completions", cfg.base_url))
+        .header("Authorization", format!("Bearer {}", cfg.api_key))
         .json(&req_body)
         .send()
         .await

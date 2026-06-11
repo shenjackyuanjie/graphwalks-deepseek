@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::Local;
 use clap::Parser;
-use deepseek_graphwalks::{api::StreamTick, eval};
+use deepseek_graphwalks::api::{ApiConfig, StreamTick};
+use deepseek_graphwalks::eval;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
@@ -99,7 +100,7 @@ impl LiveStats {
         info.chars += delta as u64;
         info.ticks.push_back((now, delta));
         // 清理 5s 外的旧 tick
-        while info.ticks.front().map_or(false, |(t, _)| now - *t > WINDOW) {
+        while info.ticks.front().is_some_and(|(t, _)| now - *t > WINDOW) {
             info.ticks.pop_front();
         }
         if info.ticks.len() >= 2 {
@@ -249,12 +250,15 @@ async fn main() -> Result<()> {
         let extract_re = extract_re.clone();
         let tick_tx = tick_tx.clone();
         async move {
+            let cfg = ApiConfig {
+                client: &client,
+                base_url: &base_url,
+                model: &model,
+                api_key: &api_key,
+            };
             let t0 = Instant::now();
             let result = eval::eval_one_streaming(
-                &client,
-                &base_url,
-                &model,
-                &api_key,
+                &cfg,
                 thinking_effort.as_deref(),
                 &extract_re,
                 &sample,

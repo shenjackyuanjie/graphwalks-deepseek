@@ -12,7 +12,7 @@ use regex::Regex;
 
 use tokio::sync::mpsc;
 
-use crate::api::{call_api, call_api_streaming, StreamTick, Usage};
+use crate::api::{call_api, call_api_streaming, ApiConfig, StreamTick, Usage};
 use crate::utils;
 
 // ── 样本 ─────────────────────────────────────────────────────────────────
@@ -118,66 +118,36 @@ pub fn load_samples(input: &Path, max_samples: Option<usize>) -> Result<Vec<Samp
 // ── 评估单条样本 ──────────────────────────────────────────────────────────
 
 pub async fn eval_one(
-    client: &reqwest::Client,
-    base_url: &str,
-    model: &str,
-    api_key: &str,
+    cfg: &ApiConfig<'_>,
     thinking_effort: Option<&str>,
     extract_re: &Regex,
     sample: &Sample,
 ) -> EvalResult {
-    eval_one_inner(client, base_url, model, api_key, thinking_effort, extract_re, sample, None)
-        .await
+    eval_one_inner(cfg, thinking_effort, extract_re, sample, None).await
 }
 
 /// 和 eval_one 相同，但使用 streaming API，实时通过 tick_tx 报告输出进度。
 pub async fn eval_one_streaming(
-    client: &reqwest::Client,
-    base_url: &str,
-    model: &str,
-    api_key: &str,
+    cfg: &ApiConfig<'_>,
     thinking_effort: Option<&str>,
     extract_re: &Regex,
     sample: &Sample,
     tick_tx: &mpsc::UnboundedSender<StreamTick>,
 ) -> EvalResult {
-    eval_one_inner(
-        client,
-        base_url,
-        model,
-        api_key,
-        thinking_effort,
-        extract_re,
-        sample,
-        Some(tick_tx),
-    )
-    .await
+    eval_one_inner(cfg, thinking_effort, extract_re, sample, Some(tick_tx)).await
 }
 
 async fn eval_one_inner(
-    client: &reqwest::Client,
-    base_url: &str,
-    model: &str,
-    api_key: &str,
+    cfg: &ApiConfig<'_>,
     thinking_effort: Option<&str>,
     extract_re: &Regex,
     sample: &Sample,
     tick_tx: Option<&mpsc::UnboundedSender<StreamTick>>,
 ) -> EvalResult {
     let api_result = if let Some(tx) = tick_tx {
-        call_api_streaming(
-            client,
-            base_url,
-            model,
-            api_key,
-            thinking_effort,
-            &sample.prompt,
-            sample.index,
-            tx,
-        )
-        .await
+        call_api_streaming(cfg, thinking_effort, &sample.prompt, sample.index, tx).await
     } else {
-        call_api(client, base_url, model, api_key, thinking_effort, &sample.prompt).await
+        call_api(cfg, thinking_effort, &sample.prompt).await
     };
 
     let (content, reasoning_content, usage) = match api_result {
