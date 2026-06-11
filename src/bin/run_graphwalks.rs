@@ -13,7 +13,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use tokio::sync::mpsc;
 
-// ── 命令行参数 ────────────────────────────────────────────────────────────
+// 命令行参数
 
 #[derive(Parser, Debug)]
 #[command(name = "run_graphwalks")]
@@ -51,9 +51,9 @@ struct Args {
     output: PathBuf,
 }
 
-// ── 实时统计 ──────────────────────────────────────────────────────────────
+// 实时统计
 
-/// 滑动窗口时长（用于 streaming TPS 和整体 TPS）。
+/// 滑动窗口时长（用于 streaming chars/s）。
 const WINDOW: Duration = Duration::from_secs(30);
 
 struct LiveStats {
@@ -118,12 +118,9 @@ impl LiveStats {
             0
         };
 
-        // streaming 输出速度（chars/sec，不做 token 估算）
         let (stream_chars, chars_per_sec) = self.stream_speed(now);
 
-        let mut parts = vec![format!(
-            "total:{total_tokens} avg:{avg_tokens}/s"
-        )];
+        let mut parts = vec![format!("total:{total_tokens} avg:{avg_tokens}/s")];
 
         if stream_chars > 0 {
             parts.push(format!("out:{stream_chars}c {chars_per_sec}c/s"));
@@ -160,7 +157,7 @@ impl LiveStats {
     }
 }
 
-// ── 主函数 ───────────────────────────────────────────────────────────────
+// 主函数
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -198,7 +195,7 @@ async fn main() -> Result<()> {
 
     let stats = Arc::new(LiveStats::new());
 
-    // tick channel: streaming delta → 后台刷新
+    // tick channel: streaming delta -> 后台刷新
     let (tick_tx, mut tick_rx) = mpsc::unbounded_channel::<StreamTick>();
 
     // 后台任务：消费 stream tick + 定时刷新进度条
@@ -224,7 +221,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        // channel 关闭后最后刷新一次
         pb_bg.set_message(stats_bg.progress_msg());
         let _ = std::io::stderr().flush();
     });
@@ -244,6 +240,7 @@ async fn main() -> Result<()> {
         let extract_re = extract_re.clone();
         let tick_tx = tick_tx.clone();
         async move {
+            let t0 = Instant::now();
             let result = eval::eval_one_streaming(
                 &client,
                 &base_url,
@@ -255,6 +252,7 @@ async fn main() -> Result<()> {
                 &tick_tx,
             )
             .await;
+            let elapsed = t0.elapsed();
 
             let prompt_tokens = result
                 .usage
@@ -264,6 +262,11 @@ async fn main() -> Result<()> {
                 .usage
                 .as_ref()
                 .map_or(0, |u| u.completion_tokens as u64);
+            let tps = if elapsed.as_secs_f64() > 0.0 {
+                completion_tokens as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
 
             let label = if result.error.is_some() {
                 format!("#{} ERR", sample.index)
@@ -276,20 +279,33 @@ async fn main() -> Result<()> {
 
             // 每个样本完成后打印一行
             let msg = if let Some(ref e) = result.error {
-                format!(
-                    "#{idx} ERR: {e}",
-                    idx = result.index,
-                )
+                format!("#{idx} ERR: {e}", idx = result.index)
             } else {
-                let t = result.usage.as_ref();
+                let u = result.usage.as_ref();
+                let mut extra = String::new();
+                if let Some(u) = u {
+                    if u.prompt_cache_hit_tokens > 0 || u.prompt_cache_miss_tokens > 0 {
+                        extra.push_str(&format!(
+                            " cache:{}/{}",
+                            u.prompt_cache_hit_tokens, u.prompt_cache_miss_tokens
+                        ));
+                    }
+                    if let Some(ref d) = u.completion_tokens_details {
+                        if d.reasoning_tokens > 0 {
+                            extra.push_str(&format!(" reason:{}", d.reasoning_tokens));
+                        }
+                    }
+                }
                 format!(
-                    "#{idx} F1={f1:.4} R={recall:.4} P={precision:.4} | prompt_tok:{prompt} comp_tok:{comp} | pred={pred:?} truth={truth:?}",
+                    "#{idx} F1={f1:.4} R={recall:.4} P={precision:.4} | in:{input_tok} out:{output_tok} {tps:.0}t/s{extra} | pred={pred:?} truth={truth:?}",
                     idx = result.index,
                     f1 = result.f1,
                     recall = result.recall,
                     precision = result.precision,
-                    prompt = t.map_or(0, |u| u.prompt_tokens),
-                    comp = t.map_or(0, |u| u.completion_tokens),
+                    input_tok = u.map_or(0, |u| u.prompt_tokens),
+                    output_tok = u.map_or(0, |u| u.completion_tokens),
+                    tps = tps,
+                    extra = extra,
                     pred = result.predicted,
                     truth = result.ground_truth,
                 )
@@ -305,7 +321,6 @@ async fn main() -> Result<()> {
 
     // drop tick_tx 以关闭后台任务
     drop(tick_tx);
-    // 给后台任务一点时间完成最后一次刷新
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     pb.finish_and_clear();
