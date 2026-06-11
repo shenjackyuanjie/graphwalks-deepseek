@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
         PathBuf::from(format!("results/eval_result_{ts}.csv"))
     });
 
-    let mut samples = eval::load_samples(&args.input, args.max_samples)?;
+    let mut samples = eval::load_samples(&args.input, None)?;
     if args.problem_type != ProblemTypeFilter::All {
         let filter_str = match args.problem_type {
             ProblemTypeFilter::Bfs => "bfs",
@@ -203,6 +203,9 @@ async fn main() -> Result<()> {
             ProblemTypeFilter::All => unreachable!(),
         };
         samples.retain(|s| s.problem_type == filter_str);
+    }
+    if let Some(max) = args.max_samples {
+        samples.truncate(max);
     }
     println!("从 {} 加载了 {} 条样本", args.input.display(), samples.len());
     println!(
