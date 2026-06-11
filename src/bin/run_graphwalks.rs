@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::Local;
 use clap::Parser;
 use deepseek_graphwalks::{api::StreamTick, eval};
 use futures::stream::{self, StreamExt};
@@ -46,9 +47,9 @@ struct Args {
     #[arg(long)]
     thinking_effort: Option<String>,
 
-    /// 输出 CSV 文件路径。
-    #[arg(short, long, default_value = "results/eval_result.csv")]
-    output: PathBuf,
+    /// 输出 CSV 文件路径。未指定时自动使用 results/eval_result_yyyy-mm-dd.csv。
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 // 实时统计
@@ -172,12 +173,17 @@ async fn main() -> Result<()> {
             .context("缺少 API 密钥：请通过 --api-key 传入或设置 DEEPSEEK_API_KEY 环境变量")?,
     };
 
+    let output = args.output.unwrap_or_else(|| {
+        let date = Local::now().format("%Y-%m-%d");
+        PathBuf::from(format!("results/eval_result_{date}.csv"))
+    });
+
     let samples = eval::load_samples(&args.input, args.max_samples)?;
     println!("从 {} 加载了 {} 条样本", args.input.display(), samples.len());
     println!(
         "并发: {}  |  输出: {}",
         args.concurrency,
-        args.output.display()
+        output.display()
     );
     println!();
 
@@ -332,12 +338,12 @@ async fn main() -> Result<()> {
     pb.finish_and_clear();
 
     // 确保输出目录存在
-    if let Some(parent) = args.output.parent() {
+    if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("无法创建目录: {}", parent.display()))?;
     }
-    eval::write_csv(&args.output, &results)?;
-    println!("结果已写入 {}", args.output.display());
+    eval::write_csv(&output, &results)?;
+    println!("结果已写入 {}", output.display());
 
     eval::print_summary(&results);
 
