@@ -138,9 +138,9 @@ impl LiveStats {
             0
         };
 
-        let mut parts = vec![format!("total:{total_tokens} avg:{avg_tokens}/s")];
+        let mut lines = vec![format!("total:{total_tokens} avg:{avg_tokens}/s")];
 
-        // 活跃请求状态
+        // 活跃请求状态，每行最多 6 个，避免并发高时撑爆终端
         let active = self.active.lock().unwrap();
         if !active.is_empty() {
             let mut items: Vec<(usize, String)> = active
@@ -151,14 +151,16 @@ impl LiveStats {
                 .collect();
             items.sort_by_key(|(idx, _)| *idx);
             let labels: Vec<_> = items.into_iter().map(|(_, s)| s).collect();
-            parts.push(format!("[{}]", labels.join(" ")));
+            for chunk in labels.chunks(6) {
+                lines.push(format!("[{}]", chunk.join(" ")));
+            }
         }
 
         if let Some(ref last) = *self.last_done.lock().unwrap() {
-            parts.push(last.clone());
+            lines.push(last.clone());
         }
 
-        parts.join(" ")
+        lines.join("\n")
     }
 }
 

@@ -18,6 +18,8 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<Thinking>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
 }
 
@@ -255,6 +257,9 @@ fn build_thinking(thinking_effort: Option<&str>) -> (Option<String>, Option<Thin
         .unwrap_or((None, None))
 }
 
+/// DeepSeek V4 系列最大输出 384K tokens。
+const MAX_OUTPUT_TOKENS: u32 = 384 * 1024;
+
 fn build_request(
     model: &str,
     prompt: &str,
@@ -271,6 +276,7 @@ fn build_request(
         temperature: Some(0.0),
         reasoning_effort,
         thinking,
+        max_tokens: Some(MAX_OUTPUT_TOKENS),
         stream: if stream { Some(true) } else { None },
     }
 }
