@@ -7,3 +7,5 @@
 # Runtime outputs for future eval runs.
 /runs/
 /reports/
+/results/
+/results_test.csv

@@ -10,7 +10,9 @@ use arrow::array::Array;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use regex::Regex;
 
-use crate::api::{call_api, Usage};
+use tokio::sync::mpsc;
+
+use crate::api::{call_api, call_api_streaming, StreamTick, Usage};
 use crate::utils;
 
 // ── 样本 ─────────────────────────────────────────────────────────────────
@@ -124,16 +126,61 @@ pub async fn eval_one(
     extract_re: &Regex,
     sample: &Sample,
 ) -> EvalResult {
-    let (content, reasoning_content, usage) = match call_api(
+    eval_one_inner(client, base_url, model, api_key, thinking_effort, extract_re, sample, None)
+        .await
+}
+
+/// 和 eval_one 相同，但使用 streaming API，实时通过 tick_tx 报告输出进度。
+pub async fn eval_one_streaming(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    thinking_effort: Option<&str>,
+    extract_re: &Regex,
+    sample: &Sample,
+    tick_tx: &mpsc::UnboundedSender<StreamTick>,
+) -> EvalResult {
+    eval_one_inner(
         client,
         base_url,
         model,
         api_key,
         thinking_effort,
-        &sample.prompt,
+        extract_re,
+        sample,
+        Some(tick_tx),
     )
     .await
-    {
+}
+
+async fn eval_one_inner(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    thinking_effort: Option<&str>,
+    extract_re: &Regex,
+    sample: &Sample,
+    tick_tx: Option<&mpsc::UnboundedSender<StreamTick>>,
+) -> EvalResult {
+    let api_result = if let Some(tx) = tick_tx {
+        call_api_streaming(
+            client,
+            base_url,
+            model,
+            api_key,
+            thinking_effort,
+            &sample.prompt,
+            sample.index,
+            tx,
+        )
+        .await
+    } else {
+        call_api(client, base_url, model, api_key, thinking_effort, &sample.prompt).await
+    };
+
+    let (content, reasoning_content, usage) = match api_result {
         Ok(r) => r,
         Err(e) => {
             return EvalResult {

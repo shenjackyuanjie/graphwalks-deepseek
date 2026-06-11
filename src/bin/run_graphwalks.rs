@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -6,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use deepseek_graphwalks::eval;
+use deepseek_graphwalks::{api::StreamTick, eval};
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
+use tokio::sync::mpsc;
 
 // ── 命令行参数 ────────────────────────────────────────────────────────────
 
@@ -51,17 +53,19 @@ struct Args {
 
 // ── 实时统计 ──────────────────────────────────────────────────────────────
 
-/// 滑动 TPS 窗口时长。
-const TPS_WINDOW: Duration = Duration::from_secs(60);
+/// 滑动窗口时长（用于 streaming TPS 和整体 TPS）。
+const WINDOW: Duration = Duration::from_secs(30);
 
 struct LiveStats {
     completed: AtomicUsize,
     total_prompt_tokens: AtomicU64,
     total_completion_tokens: AtomicU64,
-    /// 滑动窗口中每个样本完成时的 (时间戳, 本次增量 token 数)。
-    tps_events: Mutex<VecDeque<(Instant, u64)>>,
-    /// 最后一个完成的样本 F1（用于进度条展示）。
-    last_f1: Mutex<Option<String>>,
+    /// 累计 streaming 字符数（content + reasoning）。
+    stream_chars: AtomicU64,
+    /// streaming 字符增量事件 (时间, 增量字符数)。
+    stream_ticks: Mutex<VecDeque<(Instant, usize)>>,
+    /// 最后一个完成的样本标签。
+    last_done: Mutex<Option<String>>,
 }
 
 impl LiveStats {
@@ -70,38 +74,37 @@ impl LiveStats {
             completed: AtomicUsize::new(0),
             total_prompt_tokens: AtomicU64::new(0),
             total_completion_tokens: AtomicU64::new(0),
-            tps_events: Mutex::new(VecDeque::new()),
-            last_f1: Mutex::new(None),
+            stream_chars: AtomicU64::new(0),
+            stream_ticks: Mutex::new(VecDeque::new()),
+            last_done: Mutex::new(None),
         }
     }
 
-    /// 记录一个样本的完成。
-    fn record(&self, prompt_tokens: u64, completion_tokens: u64, f1_label: String) {
-        let now = Instant::now();
-        let delta = prompt_tokens + completion_tokens;
+    fn record_stream_tick(&self, tick: &StreamTick, now: Instant) {
+        let delta = tick.content_delta_chars + tick.reasoning_delta_chars;
+        if delta == 0 {
+            return;
+        }
+        self.stream_chars.fetch_add(delta as u64, Ordering::Relaxed);
+        let mut ticks = self.stream_ticks.lock().unwrap();
+        ticks.push_back((now, delta));
+        while ticks
+            .front()
+            .map_or(false, |(t, _)| now - *t > WINDOW)
+        {
+            ticks.pop_front();
+        }
+    }
 
+    fn record_done(&self, prompt_tokens: u64, completion_tokens: u64, label: String) {
         self.completed.fetch_add(1, Ordering::Relaxed);
         self.total_prompt_tokens
             .fetch_add(prompt_tokens, Ordering::Relaxed);
         self.total_completion_tokens
             .fetch_add(completion_tokens, Ordering::Relaxed);
-
-        // 更新滑动窗口
-        {
-            let mut events = self.tps_events.lock().unwrap();
-            events.push_back((now, delta));
-            while events
-                .front()
-                .map_or(false, |(t, _)| now - *t > TPS_WINDOW)
-            {
-                events.pop_front();
-            }
-        }
-
-        *self.last_f1.lock().unwrap() = Some(f1_label);
+        *self.last_done.lock().unwrap() = Some(label);
     }
 
-    /// 格式化进度条消息。
     fn progress_msg(&self) -> String {
         let now = Instant::now();
         let completed = self.completed.load(Ordering::Relaxed);
@@ -115,33 +118,45 @@ impl LiveStats {
             0
         };
 
-        let tps = self.sliding_tps(now);
+        // streaming 输出速度 (chars/sec → 近似 tok/sec，除以 4)
+        let (stream_chars, stream_tps) = self.stream_speed(now);
 
-        let last = self.last_f1.lock().unwrap().clone().unwrap_or_default();
+        let mut parts = vec![format!(
+            "total:{total_tokens} avg:{avg_tokens}/s"
+        )];
 
-        format!(
-            "tokens:{total_tokens} avg:{avg_tokens}/s TPS:{tps:.0} {last}",
-        )
+        if stream_chars > 0 {
+            parts.push(format!("out:{stream_chars}c {stream_tps}t/s"));
+        }
+
+        if let Some(ref last) = *self.last_done.lock().unwrap() {
+            parts.push(last.clone());
+        }
+
+        parts.join(" ")
     }
 
-    fn sliding_tps(&self, now: Instant) -> f64 {
-        let mut events = self.tps_events.lock().unwrap();
-        while events
+    /// 返回 (窗口内字符数, 近似 token/sec)。
+    fn stream_speed(&self, now: Instant) -> (u64, u64) {
+        let mut ticks = self.stream_ticks.lock().unwrap();
+        while ticks
             .front()
-            .map_or(false, |(t, _)| now - *t > TPS_WINDOW)
+            .map_or(false, |(t, _)| now - *t > WINDOW)
         {
-            events.pop_front();
+            ticks.pop_front();
         }
-        if events.len() < 2 {
-            return 0.0;
+        if ticks.len() < 2 {
+            return (0, 0);
         }
-        let first_time = events.front().unwrap().0;
-        let window_tokens: u64 = events.iter().map(|(_, tokens)| tokens).sum();
+        let first_time = ticks.front().unwrap().0;
+        let window_chars: usize = ticks.iter().map(|(_, n)| n).sum();
         let duration = (now - first_time).as_secs_f64();
-        if duration > 0.0 {
-            window_tokens as f64 / duration
+        if duration > 0.3 {
+            let chars_per_sec = window_chars as f64 / duration;
+            // 粗略：~4 chars/token
+            (self.stream_chars.load(Ordering::Relaxed), (chars_per_sec / 4.0) as u64)
         } else {
-            0.0
+            (0, 0)
         }
     }
 }
@@ -160,7 +175,11 @@ async fn main() -> Result<()> {
 
     let samples = eval::load_samples(&args.input, args.max_samples)?;
     println!("从 {} 加载了 {} 条样本", args.input.display(), samples.len());
-    println!("并发: {}  |  输出: {}", args.concurrency, args.output.display());
+    println!(
+        "并发: {}  |  输出: {}",
+        args.concurrency,
+        args.output.display()
+    );
     println!();
 
     let client = Arc::new(reqwest::Client::new());
@@ -179,6 +198,38 @@ async fn main() -> Result<()> {
     );
 
     let stats = Arc::new(LiveStats::new());
+
+    // tick channel: streaming delta → 后台刷新
+    let (tick_tx, mut tick_rx) = mpsc::unbounded_channel::<StreamTick>();
+
+    // 后台任务：消费 stream tick + 定时刷新进度条
+    let stats_bg = stats.clone();
+    let pb_bg = pb.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    pb_bg.set_message(stats_bg.progress_msg());
+                    let _ = std::io::stderr().flush();
+                }
+                tick = tick_rx.recv() => {
+                    match tick {
+                        Some(t) => {
+                            stats_bg.record_stream_tick(&t, Instant::now());
+                            pb_bg.set_message(stats_bg.progress_msg());
+                            let _ = std::io::stderr().flush();
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        // channel 关闭后最后刷新一次
+        pb_bg.set_message(stats_bg.progress_msg());
+        let _ = std::io::stderr().flush();
+    });
+
     let concurrency = args.concurrency;
     let thinking_effort = Arc::new(args.thinking_effort);
     let extract_re = Arc::new(Regex::new("Final Answer: ?\\[(.*?)\\]").unwrap());
@@ -192,8 +243,9 @@ async fn main() -> Result<()> {
         let stats = stats.clone();
         let thinking_effort = thinking_effort.clone();
         let extract_re = extract_re.clone();
+        let tick_tx = tick_tx.clone();
         async move {
-            let result = eval::eval_one(
+            let result = eval::eval_one_streaming(
                 &client,
                 &base_url,
                 &model,
@@ -201,6 +253,7 @@ async fn main() -> Result<()> {
                 thinking_effort.as_deref(),
                 &extract_re,
                 &sample,
+                &tick_tx,
             )
             .await;
 
@@ -213,15 +266,14 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map_or(0, |u| u.completion_tokens as u64);
 
-            let f1_label = if result.error.is_some() {
+            let label = if result.error.is_some() {
                 format!("#{} ERR", sample.index)
             } else {
                 format!("#{} F1={:.2}", sample.index, result.f1)
             };
 
-            stats.record(prompt_tokens, completion_tokens, f1_label);
+            stats.record_done(prompt_tokens, completion_tokens, label);
             pb.inc(1);
-            pb.set_message(stats.progress_msg());
 
             // 实时打印非完美样本
             if result.f1 < 0.999 || result.error.is_some() {
@@ -247,6 +299,11 @@ async fn main() -> Result<()> {
     .buffer_unordered(concurrency)
     .collect()
     .await;
+
+    // drop tick_tx 以关闭后台任务
+    drop(tick_tx);
+    // 给后台任务一点时间完成最后一次刷新
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     pb.finish_and_clear();
 
