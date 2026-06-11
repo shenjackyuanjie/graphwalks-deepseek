@@ -47,7 +47,7 @@ struct Args {
     #[arg(long)]
     thinking_effort: Option<String>,
 
-    /// 输出 CSV 文件路径。未指定时自动使用 results/eval_result_yyyy-mm-dd.csv。
+    /// 输出 CSV 文件路径。未指定时自动使用 results/eval_result_yyyy-mm-dd_HH-MM-SS.csv。
     #[arg(short, long)]
     output: Option<PathBuf>,
 }
@@ -174,8 +174,8 @@ async fn main() -> Result<()> {
     };
 
     let output = args.output.unwrap_or_else(|| {
-        let date = Local::now().format("%Y-%m-%d");
-        PathBuf::from(format!("results/eval_result_{date}.csv"))
+        let ts = Local::now().format("%Y-%m-%d_%H-%M-%S");
+        PathBuf::from(format!("results/eval_result_{ts}.csv"))
     });
 
     let samples = eval::load_samples(&args.input, args.max_samples)?;
