@@ -19,6 +19,8 @@ dataset/
   graphwalks_256k_to_1mil.parquet
   graphwalks_128k_and_shorter.deepseek_v4_tokens.parquet
   graphwalks_256k_to_1mil.deepseek_v4_tokens.parquet
+  graphwalks_256k.deepseek_v4_tokens.parquet          # 由 256k_to_1mil 拆分，token <= 1M
+  graphwalks_1mil.deepseek_v4_tokens.parquet          # 由 256k_to_1mil 拆分，token > 1M
 tokenizer/
   deepseek-v4-pro/
     tokenizer.json
@@ -88,6 +90,27 @@ tokenizer.encode(prompt, false)
 也就是说，只统计原始 `prompt` 文本本身，不包含 special tokens，也不包含
 Chat API 里 role / chat template 包装带来的额外 token。
 
+## 拆分 256k_to_1mil 数据集
+
+`graphwalks_256k_to_1mil` 内部实际上是两组长度离散的样本：
+一组在 ~257k tokens，另一组在 ~1031k tokens（略超 1M）。
+用 `split_by_token_count` 按 1,000,000 为阈值把它们拆开：
+
+```powershell
+cargo run --release --bin split_by_token_count -- `
+  --input  dataset\graphwalks_256k_to_1mil.deepseek_v4_tokens.parquet `
+  --output-low  dataset\graphwalks_256k.deepseek_v4_tokens.parquet `
+  --output-high dataset\graphwalks_1mil.deepseek_v4_tokens.parquet
+```
+
+输出：
+
+```text
+完成。threshold=1000000
+  <= threshold: 200 行 → dataset/graphwalks_256k.deepseek_v4_tokens.parquet
+  >  threshold: 200 行 → dataset/graphwalks_1mil.deepseek_v4_tokens.parquet
+```
+
 ## token 分布
 
 运行：
@@ -136,28 +159,33 @@ cargo run --release --bin token_stats -- `
 
 bfs 均值: 36585.7 | parents 均值: 32187.2
 
-### graphwalks_256k_to_1mil（400 行）
+### graphwalks_256k_to_1mil（400 行，拆分前）
 
 行数: 400 | 最小值: 257107 | 最大值: 1032668 | 均值: 644715.9 | >1M: 200
 
+内部含两组离散长度，已用 `split_by_token_count` 按 1,000,000 拆开，见下方两表。
+
+### graphwalks_256k（200 行）
+
+行数: 200 | 最小值: 257107 | 最大值: 258176 | 均值: 257659.4 | >1M: 0
+
 | Token 区间 | 合计 | bfs | parents |
 |---|---:|---:|---:|
-| <=8k | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) |
-| 8k-16k | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) |
-| 16k-32k | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) |
-| 32k-64k | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) |
-| 64k-128k | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) |
-| 128k-256k | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) |
-| 256k-512k | 200 (50.00%) | 100 (50.00%) | 100 (50.00%) |
-| 512k-1M | 0 (0.00%) | 0 (0.00%) | 0 (0.00%) |
-| >1M | 200 (50.00%) | 100 (50.00%) | 100 (50.00%) |
-| **合计** | **400** | **200** | **200** |
+| 256k-512k | 200 (100.00%) | 100 (100.00%) | 100 (100.00%) |
+| **合计** | **200** | **100** | **100** |
 
-bfs 均值: 644713.1 | parents 均值: 644718.8
+bfs 均值: 257642.2 | parents 均值: 257676.7
 
-`512k-1M` 这一档为空，是因为长文件实际上更像是两组离散长度：一组在
-256k 附近，另一组在 1M 附近。按 DeepSeek V4 tokenizer 计算时，1M 组会
-略微超过 1,000,000 tokens，所以落入 `>1M`。
+### graphwalks_1mil（200 行）
+
+行数: 200 | 最小值: 1030800 | 最大值: 1032668 | 均值: 1031772.4 | >1M: 200
+
+| Token 区间 | 合计 | bfs | parents |
+|---|---:|---:|---:|
+| >1M | 200 (100.00%) | 100 (100.00%) | 100 (100.00%) |
+| **合计** | **200** | **100** | **100** |
+
+bfs 均值: 1031784.0 | parents 均值: 1031760.9
 
 ## 程序
 
@@ -178,3 +206,13 @@ token_stats
 
 作用：读取已经生成的 token parquet 文件，输出 token 分段统计表。
 支持按 `problem_type` 列（如 `bfs` / `parents`）自动分组输出，同时输出每个输入文件的独立统计。
+
+拆分 binary：
+
+```text
+split_by_token_count
+```
+
+作用：按 `deepseek_v4_input_tokens` 阈值（默认 1,000,000）把一个 parquet 文件
+拆成两个，保留所有原始列。用于把 `graphwalks_256k_to_1mil` 拆成
+`graphwalks_256k`（~257k tokens）和 `graphwalks_1mil`（~1031k tokens）。
