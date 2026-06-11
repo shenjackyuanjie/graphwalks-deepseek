@@ -19,6 +19,14 @@ use tokio::sync::mpsc;
 
 // 命令行参数
 
+#[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq)]
+enum ProblemTypeFilter {
+    #[default]
+    All,
+    Bfs,
+    Parents,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "run_graphwalks")]
 struct Args {
@@ -53,6 +61,10 @@ struct Args {
     /// 输出 CSV 文件路径。未指定时自动使用 results/eval_result_yyyy-mm-dd_HH-MM-SS.csv。
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// 只测试指定问题类型：bfs / parents / all（默认 all）。
+    #[arg(long, value_enum, default_value_t = ProblemTypeFilter::All)]
+    problem_type: ProblemTypeFilter,
 }
 
 // 实时统计
@@ -183,7 +195,15 @@ async fn main() -> Result<()> {
         PathBuf::from(format!("results/eval_result_{ts}.csv"))
     });
 
-    let samples = eval::load_samples(&args.input, args.max_samples)?;
+    let mut samples = eval::load_samples(&args.input, args.max_samples)?;
+    if args.problem_type != ProblemTypeFilter::All {
+        let filter_str = match args.problem_type {
+            ProblemTypeFilter::Bfs => "bfs",
+            ProblemTypeFilter::Parents => "parents",
+            ProblemTypeFilter::All => unreachable!(),
+        };
+        samples.retain(|s| s.problem_type == filter_str);
+    }
     println!("从 {} 加载了 {} 条样本", args.input.display(), samples.len());
     println!(
         "并发: {}  |  输出: {}",
