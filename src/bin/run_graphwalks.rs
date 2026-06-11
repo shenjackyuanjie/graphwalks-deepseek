@@ -274,23 +274,27 @@ async fn main() -> Result<()> {
             stats.record_done(prompt_tokens, completion_tokens, label);
             pb.inc(1);
 
-            // 实时打印非完美样本
-            if result.f1 < 0.999 || result.error.is_some() {
-                let msg = if let Some(ref e) = result.error {
-                    format!("#{} 错误: {e}", result.index)
-                } else {
-                    format!(
-                        "#{} F1={:.4} R={:.4} P={:.4} | pred={:?} truth={:?}",
-                        result.index,
-                        result.f1,
-                        result.recall,
-                        result.precision,
-                        result.predicted,
-                        result.ground_truth,
-                    )
-                };
-                pb.println(msg);
-            }
+            // 每个样本完成后打印一行
+            let msg = if let Some(ref e) = result.error {
+                format!(
+                    "#{idx} ERR: {e}",
+                    idx = result.index,
+                )
+            } else {
+                let t = result.usage.as_ref();
+                format!(
+                    "#{idx} F1={f1:.4} R={recall:.4} P={precision:.4} | prompt_tok:{prompt} comp_tok:{comp} | pred={pred:?} truth={truth:?}",
+                    idx = result.index,
+                    f1 = result.f1,
+                    recall = result.recall,
+                    precision = result.precision,
+                    prompt = t.map_or(0, |u| u.prompt_tokens),
+                    comp = t.map_or(0, |u| u.completion_tokens),
+                    pred = result.predicted,
+                    truth = result.ground_truth,
+                )
+            };
+            pb.println(msg);
 
             result
         }
