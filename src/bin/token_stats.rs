@@ -18,27 +18,43 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     let buckets = stats::buckets();
-    let mut per_file = Vec::new();
-    let mut all = stats::Stats {
-        bucket_counts: vec![0; buckets.len()],
-        ..stats::Stats::default()
+    let mut per_file: Vec<(PathBuf, stats::StatsReport)> = Vec::new();
+    let mut all = stats::StatsReport {
+        overall: stats::Stats {
+            bucket_counts: vec![0; buckets.len()],
+            ..stats::Stats::default()
+        },
+        by_type: Default::default(),
     };
 
     for input in &args.inputs {
-        let st = stats::read_stats(input, args.batch_size, &buckets)?;
-        stats::merge_stats(&mut all, &st);
-        per_file.push((input.clone(), st));
+        let report = stats::read_stats(input, args.batch_size, &buckets)?;
+        stats::merge_report(&mut all, &report, &buckets);
+        per_file.push((input.clone(), report));
     }
 
     println!("# DeepSeek V4 Token 数分布\n");
     println!("统计列: `{}`", stats::TOKEN_COL);
     println!("区间为 `[下限, 上限)`，最后一个区间除外。\n");
 
-    stats::print_table("全部文件", &all, &buckets);
-    for (path, st) in per_file {
+    print_report("全部文件", &all, &buckets);
+
+    for (path, report) in &per_file {
         println!();
-        stats::print_table(&path.to_string_lossy(), &st, &buckets);
+        print_report(&path.to_string_lossy(), report, &buckets);
     }
 
     Ok(())
+}
+
+fn print_report(title: &str, report: &stats::StatsReport, buckets: &[stats::Bucket]) {
+    stats::print_table(&format!("{title} — 合计"), &report.overall, buckets);
+
+    // 按 problem_type 排序后逐一输出
+    let mut sorted_types: Vec<&String> = report.by_type.keys().collect();
+    sorted_types.sort();
+    for pt in sorted_types {
+        println!();
+        stats::print_table(&format!("{title} — {pt}"), &report.by_type[pt], buckets);
+    }
 }

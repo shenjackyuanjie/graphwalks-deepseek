@@ -1,13 +1,15 @@
 //! Token 统计：从 parquet 的 token 数列读取并计算分布。
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use arrow::array::{Array, Int32Array};
+use arrow::array::{Array, Int32Array, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 pub const TOKEN_COL: &str = "deepseek_v4_input_tokens";
+pub const PROBLEM_TYPE_COL: &str = "problem_type";
 
 #[derive(Clone, Copy)]
 pub struct Bucket {
@@ -40,8 +42,15 @@ pub fn buckets() -> Vec<Bucket> {
     ]
 }
 
-/// 从 parquet 文件读取 TOKEN_COL 列并计算统计信息。
-pub fn read_stats(path: &Path, batch_size: usize, buckets: &[Bucket]) -> Result<Stats> {
+/// 按文件整体及按 problem_type 分组的统计结果。
+pub struct StatsReport {
+    pub overall: Stats,
+    /// key = problem_type 值（如 "bfs" / "parents"）。
+    pub by_type: HashMap<String, Stats>,
+}
+
+/// 从 parquet 文件读取 TOKEN_COL 列并计算统计信息，同时按 problem_type 分组。
+pub fn read_stats(path: &Path, batch_size: usize, buckets: &[Bucket]) -> Result<StatsReport> {
     let file = File::open(path)
         .with_context(|| format!("无法打开输入 parquet: {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -51,33 +60,53 @@ pub fn read_stats(path: &Path, batch_size: usize, buckets: &[Bucket]) -> Result<
         .build()
         .with_context(|| format!("无法构建 parquet reader: {}", path.display()))?;
 
-    let mut stats = Stats {
+    let mut overall = Stats {
         bucket_counts: vec![0; buckets.len()],
         ..Stats::default()
     };
+    let mut by_type: HashMap<String, Stats> = HashMap::new();
 
     for batch in reader {
         let batch = batch.with_context(|| "读取 parquet batch 失败")?;
-        let idx = batch
-            .schema()
+        let schema = batch.schema();
+        let token_idx = schema
             .index_of(TOKEN_COL)
             .with_context(|| format!("找不到列 {TOKEN_COL:?}"))?;
         let arr = batch
-            .column(idx)
+            .column(token_idx)
             .as_any()
             .downcast_ref::<Int32Array>()
             .ok_or_else(|| anyhow!("列 {TOKEN_COL:?} 不是 Int32 类型"))?;
+
+        let type_arr: Option<&StringArray> = schema.index_of(PROBLEM_TYPE_COL).ok().map(|idx| {
+            batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("problem_type 列不是 String 类型")
+        });
 
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 continue;
             }
             let n = arr.value(i);
-            update_stats(&mut stats, n, buckets);
+            update_stats(&mut overall, n, buckets);
+
+            if let Some(types) = type_arr {
+                if !types.is_null(i) {
+                    let pt = types.value(i).to_owned();
+                    let entry = by_type.entry(pt).or_insert_with(|| Stats {
+                        bucket_counts: vec![0; buckets.len()],
+                        ..Stats::default()
+                    });
+                    update_stats(entry, n, buckets);
+                }
+            }
         }
     }
 
-    Ok(stats)
+    Ok(StatsReport { overall, by_type })
 }
 
 fn update_stats(stats: &mut Stats, tokens: i32, buckets: &[Bucket]) {
@@ -97,6 +126,17 @@ fn update_stats(stats: &mut Stats, tokens: i32, buckets: &[Bucket]) {
             stats.bucket_counts[idx] += 1;
             return;
         }
+    }
+}
+
+pub fn merge_report(dst: &mut StatsReport, src: &StatsReport, buckets: &[Bucket]) {
+    merge_stats(&mut dst.overall, &src.overall);
+    for (pt, src_st) in &src.by_type {
+        let entry = dst.by_type.entry(pt.clone()).or_insert_with(|| Stats {
+            bucket_counts: vec![0; buckets.len()],
+            ..Stats::default()
+        });
+        merge_stats(entry, src_st);
     }
 }
 
