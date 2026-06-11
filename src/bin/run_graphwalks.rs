@@ -54,7 +54,7 @@ struct Args {
 // 实时统计
 
 /// 滑动窗口时长（用于 streaming chars/s）。
-const WINDOW: Duration = Duration::from_secs(30);
+const WINDOW: Duration = Duration::from_secs(5);
 
 struct LiveStats {
     completed: AtomicUsize,
