@@ -1,5 +1,8 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,9 +44,106 @@ struct Args {
     #[arg(long)]
     thinking_effort: Option<String>,
 
-    /// 输出 CSV 文件，写入每条样本的评分结果。
-    #[arg(short, long)]
-    output: Option<PathBuf>,
+    /// 输出 CSV 文件路径。
+    #[arg(short, long, default_value = "results/eval_result.csv")]
+    output: PathBuf,
+}
+
+// ── 实时统计 ──────────────────────────────────────────────────────────────
+
+/// 滑动 TPS 窗口时长。
+const TPS_WINDOW: Duration = Duration::from_secs(60);
+
+struct LiveStats {
+    completed: AtomicUsize,
+    total_prompt_tokens: AtomicU64,
+    total_completion_tokens: AtomicU64,
+    /// 滑动窗口中每个样本完成时的 (时间戳, 本次增量 token 数)。
+    tps_events: Mutex<VecDeque<(Instant, u64)>>,
+    /// 最后一个完成的样本 F1（用于进度条展示）。
+    last_f1: Mutex<Option<String>>,
+}
+
+impl LiveStats {
+    fn new() -> Self {
+        Self {
+            completed: AtomicUsize::new(0),
+            total_prompt_tokens: AtomicU64::new(0),
+            total_completion_tokens: AtomicU64::new(0),
+            tps_events: Mutex::new(VecDeque::new()),
+            last_f1: Mutex::new(None),
+        }
+    }
+
+    /// 记录一个样本的完成。
+    fn record(&self, prompt_tokens: u64, completion_tokens: u64, f1_label: String) {
+        let now = Instant::now();
+        let delta = prompt_tokens + completion_tokens;
+
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.total_prompt_tokens
+            .fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.total_completion_tokens
+            .fetch_add(completion_tokens, Ordering::Relaxed);
+
+        // 更新滑动窗口
+        {
+            let mut events = self.tps_events.lock().unwrap();
+            events.push_back((now, delta));
+            while events
+                .front()
+                .map_or(false, |(t, _)| now - *t > TPS_WINDOW)
+            {
+                events.pop_front();
+            }
+        }
+
+        *self.last_f1.lock().unwrap() = Some(f1_label);
+    }
+
+    /// 格式化进度条消息。
+    fn progress_msg(&self) -> String {
+        let now = Instant::now();
+        let completed = self.completed.load(Ordering::Relaxed);
+        let prompt = self.total_prompt_tokens.load(Ordering::Relaxed);
+        let completion = self.total_completion_tokens.load(Ordering::Relaxed);
+        let total_tokens = prompt + completion;
+
+        let avg_tokens = if completed > 0 {
+            total_tokens / completed as u64
+        } else {
+            0
+        };
+
+        let tps = self.sliding_tps(now);
+
+        let last = self.last_f1.lock().unwrap().clone().unwrap_or_default();
+
+        format!(
+            "tokens:{total_tokens} avg:{avg_tokens}/s TPS:{tps:.0} {last}",
+        )
+    }
+
+    fn sliding_tps(&self, now: Instant) -> f64 {
+        let mut events = self.tps_events.lock().unwrap();
+        while events
+            .front()
+            .map_or(false, |(t, _)| now - *t > TPS_WINDOW)
+        {
+            events.pop_front();
+        }
+        if events.len() < 2 {
+            return 0.0;
+        }
+        let first_time = events.front().unwrap().0;
+        let window_tokens: u64 = events.iter().map(|(_, tokens)| tokens).sum();
+        let duration = (now - first_time).as_secs_f64();
+        if duration > 0.0 {
+            window_tokens as f64 / duration
+        } else {
+            0.0
+        }
+    }
 }
 
 // ── 主函数 ───────────────────────────────────────────────────────────────
@@ -60,13 +160,16 @@ async fn main() -> Result<()> {
 
     let samples = eval::load_samples(&args.input, args.max_samples)?;
     println!("从 {} 加载了 {} 条样本", args.input.display(), samples.len());
+    println!("并发: {}  |  输出: {}", args.concurrency, args.output.display());
+    println!();
 
     let client = Arc::new(reqwest::Client::new());
     let base_url = Arc::new(args.base_url.trim_end_matches('/').to_owned());
     let model = Arc::new(args.model);
     let api_key = Arc::new(api_key);
 
-    let pb = Arc::new(ProgressBar::new(samples.len() as u64));
+    let total = samples.len() as u64;
+    let pb = Arc::new(ProgressBar::new(total));
     pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
@@ -75,6 +178,7 @@ async fn main() -> Result<()> {
         .progress_chars("#>-"),
     );
 
+    let stats = Arc::new(LiveStats::new());
     let concurrency = args.concurrency;
     let thinking_effort = Arc::new(args.thinking_effort);
     let extract_re = Arc::new(Regex::new("Final Answer: ?\\[(.*?)\\]").unwrap());
@@ -85,6 +189,7 @@ async fn main() -> Result<()> {
         let model = model.clone();
         let api_key = api_key.clone();
         let pb = pb.clone();
+        let stats = stats.clone();
         let thinking_effort = thinking_effort.clone();
         let extract_re = extract_re.clone();
         async move {
@@ -98,8 +203,44 @@ async fn main() -> Result<()> {
                 &sample,
             )
             .await;
+
+            let prompt_tokens = result
+                .usage
+                .as_ref()
+                .map_or(0, |u| u.prompt_tokens as u64);
+            let completion_tokens = result
+                .usage
+                .as_ref()
+                .map_or(0, |u| u.completion_tokens as u64);
+
+            let f1_label = if result.error.is_some() {
+                format!("#{} ERR", sample.index)
+            } else {
+                format!("#{} F1={:.2}", sample.index, result.f1)
+            };
+
+            stats.record(prompt_tokens, completion_tokens, f1_label);
             pb.inc(1);
-            pb.set_message(format!("#{}", sample.index));
+            pb.set_message(stats.progress_msg());
+
+            // 实时打印非完美样本
+            if result.f1 < 0.999 || result.error.is_some() {
+                let msg = if let Some(ref e) = result.error {
+                    format!("#{} 错误: {e}", result.index)
+                } else {
+                    format!(
+                        "#{} F1={:.4} R={:.4} P={:.4} | pred={:?} truth={:?}",
+                        result.index,
+                        result.f1,
+                        result.recall,
+                        result.precision,
+                        result.predicted,
+                        result.ground_truth,
+                    )
+                };
+                pb.println(msg);
+            }
+
             result
         }
     }))
@@ -109,10 +250,13 @@ async fn main() -> Result<()> {
 
     pb.finish_and_clear();
 
-    if let Some(ref out_path) = args.output {
-        eval::write_csv(out_path, &results)?;
-        println!("结果已写入 {}", out_path.display());
+    // 确保输出目录存在
+    if let Some(parent) = args.output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建目录: {}", parent.display()))?;
     }
+    eval::write_csv(&args.output, &results)?;
+    println!("结果已写入 {}", args.output.display());
 
     eval::print_summary(&results);
 
