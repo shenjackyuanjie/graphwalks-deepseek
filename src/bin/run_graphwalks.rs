@@ -27,7 +27,7 @@ struct Args {
     api_key: Option<String>,
 
     /// 模型名称。
-    #[arg(long, default_value = "deepseek-chat")]
+    #[arg(long, default_value = "deepseek-v4-flash")]
     model: String,
 
     /// 输入的 parquet 文件（graphwalks 数据集）。
@@ -118,15 +118,15 @@ impl LiveStats {
             0
         };
 
-        // streaming 输出速度 (chars/sec → 近似 tok/sec，除以 4)
-        let (stream_chars, stream_tps) = self.stream_speed(now);
+        // streaming 输出速度（chars/sec，不做 token 估算）
+        let (stream_chars, chars_per_sec) = self.stream_speed(now);
 
         let mut parts = vec![format!(
             "total:{total_tokens} avg:{avg_tokens}/s"
         )];
 
         if stream_chars > 0 {
-            parts.push(format!("out:{stream_chars}c {stream_tps}t/s"));
+            parts.push(format!("out:{stream_chars}c {chars_per_sec}c/s"));
         }
 
         if let Some(ref last) = *self.last_done.lock().unwrap() {
@@ -136,7 +136,7 @@ impl LiveStats {
         parts.join(" ")
     }
 
-    /// 返回 (窗口内字符数, 近似 token/sec)。
+    /// 返回 (累计字符数, 窗口内 chars/sec)。
     fn stream_speed(&self, now: Instant) -> (u64, u64) {
         let mut ticks = self.stream_ticks.lock().unwrap();
         while ticks
@@ -153,8 +153,7 @@ impl LiveStats {
         let duration = (now - first_time).as_secs_f64();
         if duration > 0.3 {
             let chars_per_sec = window_chars as f64 / duration;
-            // 粗略：~4 chars/token
-            (self.stream_chars.load(Ordering::Relaxed), (chars_per_sec / 4.0) as u64)
+            (self.stream_chars.load(Ordering::Relaxed), chars_per_sec as u64)
         } else {
             (0, 0)
         }
