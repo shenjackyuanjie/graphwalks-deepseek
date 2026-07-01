@@ -32,18 +32,19 @@
 
 | Token | ID | `special` |
 |---|---:|---:|
-| `<|pangu_text_start|>` | 148899 | true |
-| `<|pangu_text_end|>` | 148900 | true |
-| `<|message_start|>` | 148901 | true |
-| `<|message_end|>` | 148902 | true |
-| `<|tool_call_start|>` | 148903 | false |
-| `<|tool_call_end|>` | 148904 | false |
+| `<\|pangu_text_start\|>` | 148899 | true |
+| `<\|pangu_text_end\|>` | 148900 | true |
+| `<\|message_start\|>` | 148901 | true |
+| `<\|message_end\|>` | 148902 | true |
+| `<\|tool_call_start\|>` | 148903 | false |
+| `<\|tool_call_end\|>` | 148904 | false |
 | `<think>` | 148905 | false |
 | `</think>` | 148906 | false |
-| `<|vision_start|>` | 148907 | true |
-| `<|vision_end|>` | 148908 | true |
-| `<|image_pad|>` | 148909 | true |
-| `<|video_pad|>` | 148910 | true |
+| `<\|vision_start\|>` | 148907 | true |
+| `<\|vision_end\|>` | 148908 | true |
+| `<\|image_pad\|>` | 148909 | true |
+| `<\|video_pad\|>` | 148910 | true |
+
 
 `special=false` 的工具和 thinking 标记仍然是 added token，可以作为一个 token 匹配；
 但它们不会被 `decode(..., skip_special_tokens=true)` 当作 special token 删除。
