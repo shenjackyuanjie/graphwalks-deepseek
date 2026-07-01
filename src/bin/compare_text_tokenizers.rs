@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -65,6 +66,10 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = GroupBy::TopLevel)]
     group_by: GroupBy,
+
+    /// 在每个分组内按自然文件顺序每 N 项汇总一次。
+    #[arg(long)]
+    chunk_size: Option<NonZeroUsize>,
 }
 
 #[derive(Debug)]
@@ -255,6 +260,15 @@ fn render_report(args: &Args, root: &Path, items: &[Item], primary: usize) -> St
     render_method(args, root, items, primary, &mut output);
     render_overall(&args.tokenizers, items, primary, &mut output);
     render_groups(&args.tokenizers, items, primary, &mut output);
+    if let Some(chunk_size) = args.chunk_size {
+        render_chunks(
+            &args.tokenizers,
+            items,
+            primary,
+            chunk_size.get(),
+            &mut output,
+        );
+    }
     render_quantiles(&args.tokenizers, items, primary, &mut output);
     render_perspectives(&args.tokenizers, items, &mut output);
     render_details(&args.tokenizers, items, primary, &mut output);
@@ -273,6 +287,14 @@ fn render_method(args: &Args, root: &Path, items: &[Item], primary: usize, outpu
     .unwrap();
     writeln!(output, "| 文件数 | {} |", items.len()).unwrap();
     writeln!(output, "| Tokenizer 数 | {} |", args.tokenizers.len()).unwrap();
+    writeln!(
+        output,
+        "| 分块汇总 | {} |",
+        args.chunk_size
+            .map(|size| format!("每 {} 项", size.get()))
+            .unwrap_or_else(|| "关闭".to_owned())
+    )
+    .unwrap();
     writeln!(
         output,
         "| 主对比 tokenizer | {} |",
@@ -374,6 +396,79 @@ fn render_groups(specs: &[TokenizerSpec], items: &[Item], primary: usize, output
         writeln!(output, " |").unwrap();
     }
     output.push('\n');
+}
+
+fn render_chunks(
+    specs: &[TokenizerSpec],
+    items: &[Item],
+    primary: usize,
+    chunk_size: usize,
+    output: &mut String,
+) {
+    writeln!(output, "## 每 {chunk_size} 项汇总\n").unwrap();
+    write!(output, "| 分组 | 范围 | 项数 | 字符数").unwrap();
+    for spec in specs {
+        write!(output, " | {}", escape(&spec.name)).unwrap();
+    }
+    for (index, spec) in specs.iter().enumerate() {
+        if index != primary {
+            write!(
+                output,
+                " | {} / {}",
+                escape(&spec.name),
+                escape(&specs[primary].name)
+            )
+            .unwrap();
+        }
+    }
+    writeln!(output, " |").unwrap();
+    write!(output, "|---|---|---:|---:").unwrap();
+    for _ in specs {
+        write!(output, "|---:").unwrap();
+    }
+    for index in 0..specs.len() {
+        if index != primary {
+            write!(output, "|---:").unwrap();
+        }
+    }
+    writeln!(output, "|").unwrap();
+
+    for (group, group_items) in grouped(items) {
+        for chunk in group_items.chunks(chunk_size) {
+            let totals: Vec<usize> = (0..specs.len())
+                .map(|index| chunk.iter().map(|item| item.counts[index]).sum())
+                .collect();
+            let chars: usize = chunk.iter().map(|item| item.chars).sum();
+            let range = format!(
+                "{}–{}",
+                file_label(&chunk[0].path),
+                file_label(&chunk[chunk.len() - 1].path)
+            );
+            write!(
+                output,
+                "| {} | {} | {} | {}",
+                escape(&group),
+                escape(&range),
+                chunk.len(),
+                integer(chars)
+            )
+            .unwrap();
+            for value in &totals {
+                write!(output, " | {}", integer(*value)).unwrap();
+            }
+            for (index, value) in totals.iter().enumerate() {
+                if index != primary {
+                    write!(output, " | {:.5}x", ratio(*value, totals[primary])).unwrap();
+                }
+            }
+            writeln!(output, " |").unwrap();
+        }
+    }
+    output.push('\n');
+}
+
+fn file_label(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 fn render_quantiles(specs: &[TokenizerSpec], items: &[Item], primary: usize, output: &mut String) {
