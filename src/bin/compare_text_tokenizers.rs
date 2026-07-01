@@ -441,8 +441,8 @@ fn render_chunks(
             let chars: usize = chunk.iter().map(|item| item.chars).sum();
             let range = format!(
                 "{}–{}",
-                file_label(&chunk[0].path),
-                file_label(&chunk[chunk.len() - 1].path)
+                range_label(&group, &chunk[0].path),
+                range_label(&group, &chunk[chunk.len() - 1].path)
             );
             write!(
                 output,
@@ -467,8 +467,10 @@ fn render_chunks(
     output.push('\n');
 }
 
-fn file_label(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+fn range_label<'a>(group: &str, path: &'a str) -> &'a str {
+    path.strip_prefix(group)
+        .and_then(|relative| relative.strip_prefix('/'))
+        .unwrap_or(path)
 }
 
 fn render_quantiles(specs: &[TokenizerSpec], items: &[Item], primary: usize, output: &mut String) {
@@ -797,5 +799,11 @@ mod tests {
     fn perspective_is_relative_to_selected_core() {
         assert!(perspective_summary("A", "B", 100, 120).contains("B 比 A 多 20.00%"));
         assert!(perspective_summary("A", "B", 100, 80).contains("B 比 A 少 20.00%"));
+    }
+
+    #[test]
+    fn chunk_range_keeps_nested_chapter_path() {
+        assert_eq!(range_label("book", "book/part2/50.md"), "part2/50.md");
+        assert_eq!(range_label("book", "other/1.md"), "other/1.md");
     }
 }
