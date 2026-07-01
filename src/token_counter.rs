@@ -17,16 +17,18 @@ use parquet::arrow::ArrowWriter;
 use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
-pub const TOKEN_COUNT_COL: &str = "deepseek_v4_input_tokens";
-pub const OVER_1M_COL: &str = "deepseek_v4_over_1m";
-
 /// 处理单个 parquet 文件：读 text_col 列 → tokenize → 追加列 → 写出。
 pub fn process_file(
     input_path: &Path,
     tokenizer: Arc<Tokenizer>,
     text_col: &str,
     batch_size: usize,
+    output_tag: &str,
 ) -> Result<()> {
+    validate_output_tag(output_tag)?;
+    let token_count_col = format!("{output_tag}_input_tokens");
+    let over_1m_col = format!("{output_tag}_over_1m");
+
     let input_file = File::open(input_path)
         .with_context(|| format!("无法打开输入 parquet: {}", input_path.display()))?;
 
@@ -34,10 +36,11 @@ pub fn process_file(
         .with_context(|| format!("无法创建 parquet reader: {}", input_path.display()))?;
 
     let input_schema = builder.schema().clone();
-    if input_schema.index_of(TOKEN_COUNT_COL).is_ok() || input_schema.index_of(OVER_1M_COL).is_ok()
+    if input_schema.index_of(&token_count_col).is_ok()
+        || input_schema.index_of(&over_1m_col).is_ok()
     {
         return Err(anyhow!(
-            "输入文件已包含 {TOKEN_COUNT_COL:?} 或 {OVER_1M_COL:?} 列: {}",
+            "输入文件已包含 {token_count_col:?} 或 {over_1m_col:?} 列: {}",
             input_path.display()
         ));
     }
@@ -48,7 +51,7 @@ pub fn process_file(
         .build()
         .with_context(|| format!("无法构建 parquet reader: {}", input_path.display()))?;
 
-    let output_path = output_path_for(input_path);
+    let output_path = output_path_for(input_path, output_tag);
     let output_file = File::create(&output_path)
         .with_context(|| format!("无法创建输出 parquet: {}", output_path.display()))?;
 
@@ -97,7 +100,13 @@ pub fn process_file(
             .collect();
 
         let over_1m: Vec<bool> = token_counts.iter().map(|&n| n > 1_000_000).collect();
-        let new_batch = append_columns(batch, token_counts, over_1m)?;
+        let new_batch = append_columns(
+            batch,
+            token_counts,
+            over_1m,
+            &token_count_col,
+            &over_1m_col,
+        )?;
 
         if writer.is_none() {
             writer = Some(
@@ -125,9 +134,22 @@ pub fn process_file(
     Ok(())
 }
 
-fn output_path_for(input: &Path) -> PathBuf {
+fn validate_output_tag(output_tag: &str) -> Result<()> {
+    if output_tag.is_empty()
+        || !output_tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(anyhow!(
+            "output_tag 只能包含 ASCII 字母、数字和下划线，实际为 {output_tag:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn output_path_for(input: &Path, output_tag: &str) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-    input.with_file_name(format!("{stem}.deepseek_v4_tokens.parquet"))
+    input.with_file_name(format!("{stem}.{output_tag}_tokens.parquet"))
 }
 
 fn get_text_array<'a>(batch: &'a RecordBatch, text_col: &str) -> Result<Box<dyn TextAccessor + 'a>> {
@@ -189,6 +211,8 @@ fn append_columns(
     batch: RecordBatch,
     token_counts: Vec<i32>,
     over_1m: Vec<bool>,
+    token_count_col: &str,
+    over_1m_col: &str,
 ) -> Result<RecordBatch> {
     if token_counts.len() != batch.num_rows() || over_1m.len() != batch.num_rows() {
         return Err(anyhow!(
@@ -202,11 +226,15 @@ fn append_columns(
     let old_schema = batch.schema();
     let mut fields = old_schema.fields().to_vec();
     fields.push(Arc::new(Field::new(
-        TOKEN_COUNT_COL,
+        token_count_col,
         DataType::Int32,
         false,
     )));
-    fields.push(Arc::new(Field::new(OVER_1M_COL, DataType::Boolean, false)));
+    fields.push(Arc::new(Field::new(
+        over_1m_col,
+        DataType::Boolean,
+        false,
+    )));
 
     let new_schema = Arc::new(Schema::new(fields));
 

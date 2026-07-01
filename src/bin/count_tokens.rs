@@ -8,9 +8,13 @@ use tokenizers::Tokenizer;
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// DeepSeek V4 tokenizer.json 路径。
+    /// tokenizer.json 路径。
     #[arg(long, default_value = "tokenizer/deepseek-v4-pro/tokenizer.json")]
     tokenizer_json: PathBuf,
+
+    /// 输出标识，用于生成列名和文件后缀。
+    #[arg(long, default_value = "deepseek_v4")]
+    output_tag: String,
 
     /// 要统计 token 数的文本列名。GraphWalks 数据集用 prompt。
     #[arg(long, default_value = "prompt")]
@@ -33,7 +37,13 @@ fn main() -> Result<()> {
     let tokenizer = Arc::new(tokenizer);
 
     for input in &args.inputs {
-        token_counter::process_file(input, tokenizer.clone(), &args.text_col, args.batch_size)?;
+        token_counter::process_file(
+            input,
+            tokenizer.clone(),
+            &args.text_col,
+            args.batch_size,
+            &args.output_tag,
+        )?;
     }
 
     Ok(())
