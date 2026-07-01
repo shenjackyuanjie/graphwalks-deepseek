@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -12,11 +12,32 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 
 #[derive(Clone, Debug)]
+struct TokenizerSpec {
+    name: String,
+    column: String,
+}
+
+impl FromStr for TokenizerSpec {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let (name, column) = value
+            .split_once('=')
+            .context("tokenizer 参数格式应为 NAME=TOKEN_COUNT_COLUMN")?;
+        if name.trim().is_empty() || column.is_empty() {
+            bail!("tokenizer 参数格式应为 NAME=TOKEN_COUNT_COLUMN，实际为 {value:?}");
+        }
+        Ok(Self {
+            name: name.trim().to_owned(),
+            column: column.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
 struct DatasetSpec {
     label: String,
-    v4p: PathBuf,
-    v32: PathBuf,
-    openpangu: PathBuf,
+    paths: Vec<PathBuf>,
 }
 
 impl FromStr for DatasetSpec {
@@ -25,25 +46,34 @@ impl FromStr for DatasetSpec {
     fn from_str(value: &str) -> Result<Self> {
         let (label, paths) = value
             .split_once('=')
-            .context("数据集参数格式应为 LABEL=V4P,V32,OPENPANGU")?;
-        let paths: Vec<_> = paths.split(',').collect();
-        if label.is_empty() || paths.len() != 3 || paths.iter().any(|path| path.is_empty()) {
-            bail!("数据集参数格式应为 LABEL=V4P,V32,OPENPANGU，实际为 {value:?}");
+            .context("数据集参数格式应为 LABEL=TOKENIZER_FILE,...")?;
+        let paths: Vec<PathBuf> = paths.split(',').map(PathBuf::from).collect();
+        if label.trim().is_empty()
+            || paths.is_empty()
+            || paths.iter().any(|path| path.as_os_str().is_empty())
+        {
+            bail!("数据集参数格式应为 LABEL=TOKENIZER_FILE,...，实际为 {value:?}");
         }
         Ok(Self {
-            label: label.to_owned(),
-            v4p: paths[0].into(),
-            v32: paths[1].into(),
-            openpangu: paths[2].into(),
+            label: label.trim().to_owned(),
+            paths,
         })
     }
 }
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// 数据集及三份计数文件，格式为 LABEL=V4P,V32,OPENPANGU；可重复传入。
+    /// Tokenizer 与计数列定义，可重复传入，格式为 NAME=TOKEN_COUNT_COLUMN。
+    #[arg(long = "tokenizer", required = true)]
+    tokenizers: Vec<TokenizerSpec>,
+
+    /// 每个数据集按 --tokenizer 的顺序列出计数文件。
     #[arg(long = "dataset", required = true)]
     datasets: Vec<DatasetSpec>,
+
+    /// 主对比 tokenizer 名称；省略时使用第一个 --tokenizer。
+    #[arg(long)]
+    primary: Option<String>,
 
     #[arg(long)]
     title: String,
@@ -51,18 +81,8 @@ struct Args {
     #[arg(long)]
     output: PathBuf,
 
-    /// 可选分组列，从 V4P 文件读取并按原始行顺序对齐。
     #[arg(long)]
     group_col: Option<String>,
-
-    #[arg(long, default_value = "deepseek_v4_input_tokens")]
-    v4p_col: String,
-
-    #[arg(long, default_value = "deepseek_v32_input_tokens")]
-    v32_col: String,
-
-    #[arg(long, default_value = "openpangu_2_0_flash_input_tokens")]
-    openpangu_col: String,
 
     #[arg(long, default_value_t = 8192)]
     batch_size: usize,
@@ -72,20 +92,12 @@ struct Args {
 struct Item {
     dataset: String,
     group: Option<String>,
-    v4p: i64,
-    v32: i64,
-    openpangu: i64,
-}
-
-#[derive(Clone, Copy)]
-enum CountKind {
-    V4p,
-    V32,
-    OpenPangu,
+    counts: Vec<i64>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let primary = validate_args(&args)?;
     let mut items = Vec::new();
     for dataset in &args.datasets {
         items.extend(read_dataset(dataset, &args)?);
@@ -94,7 +106,7 @@ fn main() -> Result<()> {
         bail!("输入数据集没有记录");
     }
 
-    let report = render_report(&args, &items);
+    let report = render_report(&args, &items, primary);
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("无法创建报告目录: {}", parent.display()))?;
@@ -102,47 +114,88 @@ fn main() -> Result<()> {
     fs::write(&args.output, report)
         .with_context(|| format!("无法写入报告: {}", args.output.display()))?;
     println!(
-        "已对齐统计 {} 条记录，报告写入 {}",
+        "已使用 {} 个 tokenizer 对齐统计 {} 条记录，报告写入 {}",
+        args.tokenizers.len(),
         items.len(),
         args.output.display()
     );
     Ok(())
 }
 
+fn validate_args(args: &Args) -> Result<usize> {
+    if args.tokenizers.len() < 2 {
+        bail!("至少需要传入两个 --tokenizer");
+    }
+    let mut names = HashSet::new();
+    let mut columns = HashSet::new();
+    for spec in &args.tokenizers {
+        if !names.insert(&spec.name) {
+            bail!("tokenizer 名称重复: {:?}", spec.name);
+        }
+        if !columns.insert(&spec.column) {
+            bail!("token count 列名重复: {:?}", spec.column);
+        }
+    }
+    for dataset in &args.datasets {
+        if dataset.paths.len() != args.tokenizers.len() {
+            bail!(
+                "数据集 {:?} 有 {} 个文件，但定义了 {} 个 tokenizer",
+                dataset.label,
+                dataset.paths.len(),
+                args.tokenizers.len()
+            );
+        }
+    }
+    match args.primary.as_deref() {
+        Some(name) => args
+            .tokenizers
+            .iter()
+            .position(|spec| spec.name == name)
+            .with_context(|| format!("primary {name:?} 不在 tokenizer 列表中")),
+        None => Ok(0),
+    }
+}
+
 fn read_dataset(dataset: &DatasetSpec, args: &Args) -> Result<Vec<Item>> {
-    let v4p = read_i32_column(&dataset.v4p, &args.v4p_col, args.batch_size)?;
-    let v32 = read_i32_column(&dataset.v32, &args.v32_col, args.batch_size)?;
-    let openpangu = read_i32_column(&dataset.openpangu, &args.openpangu_col, args.batch_size)?;
+    let columns: Vec<Vec<i32>> = dataset
+        .paths
+        .iter()
+        .zip(&args.tokenizers)
+        .map(|(path, spec)| read_i32_column(path, &spec.column, args.batch_size))
+        .collect::<Result<_>>()?;
+    let expected = columns[0].len();
+    for (index, values) in columns.iter().enumerate().skip(1) {
+        if values.len() != expected {
+            bail!(
+                "数据集 {:?} 行数不一致: {}={}, {}={}",
+                dataset.label,
+                args.tokenizers[0].name,
+                expected,
+                args.tokenizers[index].name,
+                values.len()
+            );
+        }
+    }
     let groups = args
         .group_col
         .as_deref()
-        .map(|column| read_string_column(&dataset.v4p, column, args.batch_size))
+        .map(|column| read_string_column(&dataset.paths[0], column, args.batch_size))
         .transpose()?;
-
-    let expected = v4p.len();
-    if v32.len() != expected
-        || openpangu.len() != expected
-        || groups
-            .as_ref()
-            .is_some_and(|values| values.len() != expected)
+    if groups
+        .as_ref()
+        .is_some_and(|values| values.len() != expected)
     {
-        bail!(
-            "数据集 {:?} 行数不一致: V4P={}, V3.2={}, OpenPangu={}, group={:?}",
-            dataset.label,
-            v4p.len(),
-            v32.len(),
-            openpangu.len(),
-            groups.as_ref().map(Vec::len)
-        );
+        bail!("数据集 {:?} 的分组列行数不一致", dataset.label);
     }
 
     Ok((0..expected)
-        .map(|index| Item {
+        .map(|row| Item {
             dataset: dataset.label.clone(),
-            group: groups.as_ref().map(|values| values[index].clone()),
-            v4p: i64::from(v4p[index]),
-            v32: i64::from(v32[index]),
-            openpangu: i64::from(openpangu[index]),
+            group: groups.as_ref().map(|values| values[row].clone()),
+            counts: columns
+                .iter()
+                .map(|values| i64::from(values[row]))
+                .collect(),
         })
         .collect())
 }
@@ -269,31 +322,53 @@ fn append_large_strings(
     Ok(())
 }
 
-fn render_report(args: &Args, items: &[Item]) -> String {
+fn render_report(args: &Args, items: &[Item], primary: usize) -> String {
     let mut output = String::new();
     writeln!(output, "# {}\n", args.title).unwrap();
-    render_method(args, items, &mut output);
-    render_overall(items, &mut output);
-    render_datasets(items, &mut output);
+    render_method(args, items, primary, &mut output);
+    render_overall(&args.tokenizers, items, primary, &mut output);
+    render_dataset_groups(
+        "按数据集",
+        &args.tokenizers,
+        items,
+        primary,
+        |item| item.dataset.clone(),
+        &mut output,
+    );
     if args.group_col.is_some() {
-        render_groups(items, &mut output);
+        render_dataset_groups(
+            "按分组列",
+            &args.tokenizers,
+            items,
+            primary,
+            |item| item.group.clone().unwrap_or_default(),
+            &mut output,
+        );
     }
-    render_buckets(items, &mut output);
-    render_quantiles(items, &mut output);
-    render_thresholds(items, &mut output);
-    render_directions(items, &mut output);
-    render_regressions(items, &mut output);
+    render_buckets(&args.tokenizers, items, primary, &mut output);
+    render_quantiles(&args.tokenizers, items, primary, &mut output);
+    render_thresholds(&args.tokenizers, items, primary, &mut output);
+    render_directions(&args.tokenizers, items, primary, &mut output);
+    render_regressions(&args.tokenizers, items, primary, &mut output);
+    render_perspectives(&args.tokenizers, items, &mut output);
     output
 }
 
-fn render_method(args: &Args, items: &[Item], output: &mut String) {
+fn render_method(args: &Args, items: &[Item], primary: usize, output: &mut String) {
     writeln!(output, "## 统计口径\n").unwrap();
     writeln!(output, "| 项目 | 值 |").unwrap();
     writeln!(output, "|---|---|").unwrap();
     writeln!(output, "| 对齐记录数 | {} |", items.len()).unwrap();
+    writeln!(output, "| Tokenizer 数 | {} |", args.tokenizers.len()).unwrap();
     writeln!(
         output,
-        "| 对齐方式 | 同一数据集三份计数文件按原始行顺序对齐，并校验行数 |"
+        "| 主对比 tokenizer | {} |",
+        escape(&args.tokenizers[primary].name)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "| 对齐方式 | 同一数据集各计数文件按原始行顺序对齐，并校验行数 |"
     )
     .unwrap();
     writeln!(
@@ -301,14 +376,15 @@ fn render_method(args: &Args, items: &[Item], output: &mut String) {
         "| 编码方式 | `Tokenizer::encode(text, false)`，不添加 special tokens |"
     )
     .unwrap();
-    writeln!(output, "| V4P 计数列 | `{}` |", escape(&args.v4p_col)).unwrap();
-    writeln!(output, "| V3.2 计数列 | `{}` |", escape(&args.v32_col)).unwrap();
-    writeln!(
-        output,
-        "| OpenPangu 计数列 | `{}` |",
-        escape(&args.openpangu_col)
-    )
-    .unwrap();
+    for spec in &args.tokenizers {
+        writeln!(
+            output,
+            "| {} 计数列 | `{}` |",
+            escape(&spec.name),
+            escape(&spec.column)
+        )
+        .unwrap();
+    }
     writeln!(
         output,
         "| 分组列 | {} |\n",
@@ -320,228 +396,342 @@ fn render_method(args: &Args, items: &[Item], output: &mut String) {
     .unwrap();
 }
 
-fn render_overall(items: &[Item], output: &mut String) {
-    let v4p_total = total(items, CountKind::V4p);
+fn render_overall(specs: &[TokenizerSpec], items: &[Item], primary: usize, output: &mut String) {
+    let primary_total = total(items, primary);
     writeln!(output, "## 总体结果\n").unwrap();
-    writeln!(output, "| Tokenizer | 总 token 数 | 平均每条 | 中位数 | 最小 | 最大 | 相对 V4P 差值 | 相对 V4P 增幅 |").unwrap();
+    writeln!(output, "| Tokenizer | 总 token 数 | 平均每条 | 中位数 | 最小 | 最大 | 相对主 tokenizer 差值 | 相对主 tokenizer 增幅 |").unwrap();
     writeln!(output, "|---|---:|---:|---:|---:|---:|---:|---:|").unwrap();
-    for (name, kind) in tokenizer_kinds() {
-        let values = counts(items, kind);
+    for (index, spec) in specs.iter().enumerate() {
+        let values = counts(items, index);
         let sum: i64 = values.iter().sum();
         writeln!(
             output,
-            "| {name} | {} | {:.2} | {:.0} | {} | {} | {:+} | {:+.2}% |",
+            "| {} | {} | {:.2} | {:.0} | {} | {} | {:+} | {:+.2}% |",
+            escape(&spec.name),
             integer(sum),
             sum as f64 / items.len() as f64,
             percentile(&values, 0.5),
             integer(*values.iter().min().unwrap()),
             integer(*values.iter().max().unwrap()),
-            sum - v4p_total,
-            percent(sum - v4p_total, v4p_total),
+            sum - primary_total,
+            percent(sum - primary_total, primary_total)
         )
         .unwrap();
     }
     output.push('\n');
 }
 
-fn render_datasets(items: &[Item], output: &mut String) {
-    writeln!(output, "## 按数据集\n").unwrap();
-    writeln!(
-        output,
-        "| 数据集 | 条数 | V4P 总量 | V3.2 总量 | OpenPangu 总量 | V3.2 / V4P | OpenPangu / V4P |"
-    )
-    .unwrap();
-    writeln!(output, "|---|---:|---:|---:|---:|---:|---:|").unwrap();
-    for (dataset, subset) in group_by(items, |item| item.dataset.clone()) {
-        render_group_row(&dataset, &subset, output);
+fn render_dataset_groups<F>(
+    title: &str,
+    specs: &[TokenizerSpec],
+    items: &[Item],
+    primary: usize,
+    key: F,
+    output: &mut String,
+) where
+    F: Fn(&Item) -> String,
+{
+    writeln!(output, "## {title}\n").unwrap();
+    write!(output, "| 分组 | 条数").unwrap();
+    for spec in specs {
+        write!(output, " | {} 总量", escape(&spec.name)).unwrap();
     }
-    render_group_row("全部", &items.iter().collect::<Vec<_>>(), output);
+    for (index, spec) in specs.iter().enumerate() {
+        if index != primary {
+            write!(
+                output,
+                " | {} / {}",
+                escape(&spec.name),
+                escape(&specs[primary].name)
+            )
+            .unwrap();
+        }
+    }
+    writeln!(output, " |").unwrap();
+    write!(output, "|---|---:").unwrap();
+    for _ in specs {
+        write!(output, "|---:").unwrap();
+    }
+    for index in 0..specs.len() {
+        if index != primary {
+            write!(output, "|---:").unwrap();
+        }
+    }
+    writeln!(output, "|").unwrap();
+
+    for (label, subset) in group_by(items, key) {
+        render_group_row(&label, specs.len(), &subset, primary, output);
+    }
+    render_group_row(
+        "全部",
+        specs.len(),
+        &items.iter().collect::<Vec<_>>(),
+        primary,
+        output,
+    );
     output.push('\n');
 }
 
-fn render_groups(items: &[Item], output: &mut String) {
-    writeln!(output, "## 按分组列\n").unwrap();
-    writeln!(
-        output,
-        "| 分组 | 条数 | V4P 总量 | V3.2 总量 | OpenPangu 总量 | V3.2 / V4P | OpenPangu / V4P |"
-    )
-    .unwrap();
-    writeln!(output, "|---|---:|---:|---:|---:|---:|---:|").unwrap();
-    for (group, subset) in group_by(items, |item| item.group.clone().unwrap_or_default()) {
-        render_group_row(&group, &subset, output);
+fn render_group_row(
+    label: &str,
+    tokenizer_count: usize,
+    items: &[&Item],
+    primary: usize,
+    output: &mut String,
+) {
+    let totals: Vec<i64> = (0..tokenizer_count)
+        .map(|index| items.iter().map(|item| item.counts[index]).sum())
+        .collect();
+    write!(output, "| {} | {}", escape(label), items.len()).unwrap();
+    for value in &totals {
+        write!(output, " | {}", integer(*value)).unwrap();
     }
-    output.push('\n');
+    for (index, value) in totals.iter().enumerate() {
+        if index != primary {
+            write!(output, " | {:.5}x", ratio(*value, totals[primary])).unwrap();
+        }
+    }
+    writeln!(output, " |").unwrap();
 }
 
-fn render_group_row(label: &str, items: &[&Item], output: &mut String) {
-    let v4p: i64 = items.iter().map(|item| item.v4p).sum();
-    let v32: i64 = items.iter().map(|item| item.v32).sum();
-    let openpangu: i64 = items.iter().map(|item| item.openpangu).sum();
-    writeln!(
-        output,
-        "| {} | {} | {} | {} | {} | {:.5}x | {:.5}x |",
-        escape(label),
-        items.len(),
-        integer(v4p),
-        integer(v32),
-        integer(openpangu),
-        ratio(v32, v4p),
-        ratio(openpangu, v4p),
-    )
-    .unwrap();
-}
-
-fn render_buckets(items: &[Item], output: &mut String) {
+fn render_buckets(specs: &[TokenizerSpec], items: &[Item], primary: usize, output: &mut String) {
     const BOUNDS: [i64; 9] = [
         2_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 512_000, 1_000_000,
     ];
-    writeln!(output, "## 按 V4P token 长度\n").unwrap();
-    writeln!(output, "| V4P 区间 | 条数 | V4P 平均 | V3.2 平均 | OpenPangu 平均 | V3.2 / V4P | OpenPangu / V4P |").unwrap();
-    writeln!(output, "|---|---:|---:|---:|---:|---:|---:|").unwrap();
+    writeln!(
+        output,
+        "## 按 {} token 长度\n",
+        escape(&specs[primary].name)
+    )
+    .unwrap();
+    write!(output, "| {} 区间 | 条数", escape(&specs[primary].name)).unwrap();
+    for spec in specs {
+        write!(output, " | {} 平均", escape(&spec.name)).unwrap();
+    }
+    for (index, spec) in specs.iter().enumerate() {
+        if index != primary {
+            write!(
+                output,
+                " | {} / {}",
+                escape(&spec.name),
+                escape(&specs[primary].name)
+            )
+            .unwrap();
+        }
+    }
+    writeln!(output, " |").unwrap();
+    write!(output, "|---|---:").unwrap();
+    for _ in specs {
+        write!(output, "|---:").unwrap();
+    }
+    for index in 0..specs.len() {
+        if index != primary {
+            write!(output, "|---:").unwrap();
+        }
+    }
+    writeln!(output, "|").unwrap();
+
     for bucket in 0..=BOUNDS.len() {
         let subset: Vec<_> = items
             .iter()
-            .filter(|item| bucket_index(item.v4p, &BOUNDS) == bucket)
+            .filter(|item| bucket_index(item.counts[primary], &BOUNDS) == bucket)
             .collect();
         if subset.is_empty() {
             continue;
         }
-        let v4p: i64 = subset.iter().map(|item| item.v4p).sum();
-        let v32: i64 = subset.iter().map(|item| item.v32).sum();
-        let openpangu: i64 = subset.iter().map(|item| item.openpangu).sum();
-        writeln!(
+        let totals: Vec<i64> = (0..specs.len())
+            .map(|index| subset.iter().map(|item| item.counts[index]).sum())
+            .collect();
+        write!(
             output,
-            "| {} | {} | {:.0} | {:.0} | {:.0} | {:.5}x | {:.5}x |",
+            "| {} | {}",
             bucket_label(bucket, &BOUNDS),
-            subset.len(),
-            v4p as f64 / subset.len() as f64,
-            v32 as f64 / subset.len() as f64,
-            openpangu as f64 / subset.len() as f64,
-            ratio(v32, v4p),
-            ratio(openpangu, v4p),
+            subset.len()
         )
         .unwrap();
+        for total in &totals {
+            write!(output, " | {:.0}", *total as f64 / subset.len() as f64).unwrap();
+        }
+        for (index, total) in totals.iter().enumerate() {
+            if index != primary {
+                write!(output, " | {:.5}x", ratio(*total, totals[primary])).unwrap();
+            }
+        }
+        writeln!(output, " |").unwrap();
     }
     output.push('\n');
 }
 
-fn render_quantiles(items: &[Item], output: &mut String) {
-    let v32_deltas: Vec<i64> = items.iter().map(|item| item.v32 - item.v4p).collect();
-    let v32_ratios: Vec<f64> = items.iter().map(|item| ratio(item.v32, item.v4p)).collect();
-    let pangu_deltas: Vec<i64> = items.iter().map(|item| item.openpangu - item.v4p).collect();
-    let pangu_ratios: Vec<f64> = items
-        .iter()
-        .map(|item| ratio(item.openpangu, item.v4p))
-        .collect();
+fn render_quantiles(specs: &[TokenizerSpec], items: &[Item], primary: usize, output: &mut String) {
     writeln!(output, "## 逐条差异分位数\n").unwrap();
     writeln!(
         output,
-        "| 分位数 | V3.2 - V4P | V3.2 / V4P | OpenPangu - V4P | OpenPangu / V4P |"
+        "| Tokenizer | 分位数 | 相对主 tokenizer 差值 | 相对主 tokenizer 比例 |"
     )
     .unwrap();
-    writeln!(output, "|---|---:|---:|---:|---:|").unwrap();
-    for (label, quantile) in quantiles() {
-        writeln!(
-            output,
-            "| {label} | {:+.0} | {:.5}x | {:+.0} | {:.5}x |",
-            percentile(&v32_deltas, quantile),
-            percentile(&v32_ratios, quantile),
-            percentile(&pangu_deltas, quantile),
-            percentile(&pangu_ratios, quantile),
-        )
-        .unwrap();
+    writeln!(output, "|---|---|---:|---:|").unwrap();
+    for (index, spec) in specs.iter().enumerate() {
+        if index == primary {
+            continue;
+        }
+        let deltas: Vec<i64> = items
+            .iter()
+            .map(|item| item.counts[index] - item.counts[primary])
+            .collect();
+        let ratios: Vec<f64> = items
+            .iter()
+            .map(|item| ratio(item.counts[index], item.counts[primary]))
+            .collect();
+        for (label, quantile) in quantiles() {
+            writeln!(
+                output,
+                "| {} | {label} | {:+.0} | {:.5}x |",
+                escape(&spec.name),
+                percentile(&deltas, quantile),
+                percentile(&ratios, quantile)
+            )
+            .unwrap();
+        }
     }
     output.push('\n');
 }
 
-fn render_thresholds(items: &[Item], output: &mut String) {
+fn render_thresholds(specs: &[TokenizerSpec], items: &[Item], primary: usize, output: &mut String) {
     writeln!(output, "## 上下文阈值\n").unwrap();
-    writeln!(output, "| 阈值 | V4P 超过数 | V3.2 超过数 | OpenPangu 超过数 | V3.2 相对 V4P 新增 | OpenPangu 相对 V4P 新增 |").unwrap();
-    writeln!(output, "|---|---:|---:|---:|---:|---:|").unwrap();
+    writeln!(
+        output,
+        "| 阈值 | Tokenizer | 超过数 | 相对主 tokenizer 增减 |"
+    )
+    .unwrap();
+    writeln!(output, "|---:|---|---:|---:|").unwrap();
     for threshold in [128_000, 256_000, 512_000, 1_000_000] {
-        let v4p = items.iter().filter(|item| item.v4p > threshold).count();
-        let v32 = items.iter().filter(|item| item.v32 > threshold).count();
-        let openpangu = items
+        let primary_count = items
             .iter()
-            .filter(|item| item.openpangu > threshold)
+            .filter(|item| item.counts[primary] > threshold)
             .count();
+        for (index, spec) in specs.iter().enumerate() {
+            let count = items
+                .iter()
+                .filter(|item| item.counts[index] > threshold)
+                .count();
+            writeln!(
+                output,
+                "| {} | {} | {count} | {:+} |",
+                integer(threshold),
+                escape(&spec.name),
+                count as i64 - primary_count as i64
+            )
+            .unwrap();
+        }
+    }
+    output.push('\n');
+}
+
+fn render_directions(specs: &[TokenizerSpec], items: &[Item], primary: usize, output: &mut String) {
+    writeln!(output, "## 相对主 tokenizer 的逐条大小关系\n").unwrap();
+    writeln!(
+        output,
+        "| Tokenizer | 小于主 tokenizer | 等于主 tokenizer | 大于主 tokenizer |"
+    )
+    .unwrap();
+    writeln!(output, "|---|---:|---:|---:|").unwrap();
+    for (index, spec) in specs.iter().enumerate() {
+        if index == primary {
+            continue;
+        }
+        let (less, equal, more) = directions(items, index, primary);
         writeln!(
             output,
-            "| {} | {v4p} | {v32} | {openpangu} | {:+} | {:+} |",
-            integer(threshold),
-            v32 as i64 - v4p as i64,
-            openpangu as i64 - v4p as i64
+            "| {} | {less} | {equal} | {more} |",
+            escape(&spec.name)
         )
         .unwrap();
     }
     output.push('\n');
 }
 
-fn render_directions(items: &[Item], output: &mut String) {
-    writeln!(output, "## 逐条大小关系\n").unwrap();
-    writeln!(output, "| 对比 | 小于 V4P | 等于 V4P | 大于 V4P |").unwrap();
-    writeln!(output, "|---|---:|---:|---:|").unwrap();
-    for (name, kind) in [
-        ("V3.2", CountKind::V32),
-        ("OpenPangu", CountKind::OpenPangu),
-    ] {
-        let values = counts(items, kind);
-        let baselines = counts(items, CountKind::V4p);
-        let less = values
-            .iter()
-            .zip(&baselines)
-            .filter(|(value, base)| value < base)
-            .count();
-        let equal = values
-            .iter()
-            .zip(&baselines)
-            .filter(|(value, base)| value == base)
-            .count();
-        let greater = values.len() - less - equal;
-        writeln!(output, "| {name} | {less} | {equal} | {greater} |").unwrap();
-    }
-    output.push('\n');
-}
-
-fn render_regressions(items: &[Item], output: &mut String) {
-    let x: Vec<f64> = items.iter().map(|item| item.v4p as f64).collect();
-    writeln!(output, "## 相对 V4P 线性拟合\n").unwrap();
+fn render_regressions(
+    specs: &[TokenizerSpec],
+    items: &[Item],
+    primary: usize,
+    output: &mut String,
+) {
+    let x: Vec<f64> = items
+        .iter()
+        .map(|item| item.counts[primary] as f64)
+        .collect();
+    writeln!(output, "## 相对主 tokenizer 线性拟合\n").unwrap();
     writeln!(output, "| Tokenizer | 斜率 | 截距 | R² | 估算式 |").unwrap();
     writeln!(output, "|---|---:|---:|---:|---|").unwrap();
-    for (name, kind) in [
-        ("V3.2", CountKind::V32),
-        ("OpenPangu", CountKind::OpenPangu),
-    ] {
-        let y: Vec<f64> = counts(items, kind)
-            .into_iter()
-            .map(|value| value as f64)
-            .collect();
+    for (index, spec) in specs.iter().enumerate() {
+        if index == primary {
+            continue;
+        }
+        let y: Vec<f64> = items.iter().map(|item| item.counts[index] as f64).collect();
         let (slope, intercept, r_squared) = linear_regression(&x, &y);
-        writeln!(output, "| {name} | {slope:.8} | {intercept:+.2} | {r_squared:.9} | `{name} ≈ {slope:.5} × V4P {intercept:+.0}` |").unwrap();
+        writeln!(
+            output,
+            "| {} | {slope:.8} | {intercept:+.2} | {r_squared:.9} | `{} ≈ {slope:.5} × {} {intercept:+.0}` |",
+            escape(&spec.name),
+            escape(&spec.name),
+            escape(&specs[primary].name)
+        )
+        .unwrap();
+    }
+    output.push('\n');
+}
+
+fn render_perspectives(specs: &[TokenizerSpec], items: &[Item], output: &mut String) {
+    writeln!(output, "## 分 tokenizer 视角结论\n").unwrap();
+    let totals: Vec<i64> = (0..specs.len()).map(|index| total(items, index)).collect();
+    for (core, core_spec) in specs.iter().enumerate() {
+        writeln!(output, "### 以 {} 为核心\n", escape(&core_spec.name)).unwrap();
+        writeln!(output, "| 对比对象 | 核心总量 | 对象总量 | 对象 - 核心 | 对象 / 核心 | 逐条对象更少 | 逐条相同 | 逐条对象更多 | 结论 |").unwrap();
+        writeln!(output, "|---|---:|---:|---:|---:|---:|---:|---:|---|").unwrap();
+        for (other, other_spec) in specs.iter().enumerate() {
+            if other == core {
+                continue;
+            }
+            let (less, equal, more) = directions(items, other, core);
+            writeln!(
+                output,
+                "| {} | {} | {} | {:+} | {:.5}x | {less} | {equal} | {more} | {} |",
+                escape(&other_spec.name),
+                integer(totals[core]),
+                integer(totals[other]),
+                totals[other] - totals[core],
+                ratio(totals[other], totals[core]),
+                perspective_summary(
+                    &core_spec.name,
+                    &other_spec.name,
+                    totals[core],
+                    totals[other]
+                )
+            )
+            .unwrap();
+        }
+        output.push('\n');
     }
 }
 
-fn tokenizer_kinds() -> [(&'static str, CountKind); 3] {
-    [
-        ("V4P", CountKind::V4p),
-        ("V3.2", CountKind::V32),
-        ("OpenPangu 2.0 Flash", CountKind::OpenPangu),
-    ]
+fn counts(items: &[Item], index: usize) -> Vec<i64> {
+    items.iter().map(|item| item.counts[index]).collect()
 }
 
-fn counts(items: &[Item], kind: CountKind) -> Vec<i64> {
-    items
+fn total(items: &[Item], index: usize) -> i64 {
+    items.iter().map(|item| item.counts[index]).sum()
+}
+
+fn directions(items: &[Item], other: usize, core: usize) -> (usize, usize, usize) {
+    let less = items
         .iter()
-        .map(|item| match kind {
-            CountKind::V4p => item.v4p,
-            CountKind::V32 => item.v32,
-            CountKind::OpenPangu => item.openpangu,
-        })
-        .collect()
-}
-
-fn total(items: &[Item], kind: CountKind) -> i64 {
-    counts(items, kind).iter().sum()
+        .filter(|item| item.counts[other] < item.counts[core])
+        .count();
+    let equal = items
+        .iter()
+        .filter(|item| item.counts[other] == item.counts[core])
+        .count();
+    (less, equal, items.len() - less - equal)
 }
 
 fn group_by<F>(items: &[Item], key: F) -> BTreeMap<String, Vec<&Item>>
@@ -598,11 +788,13 @@ fn quantiles() -> [(&'static str, f64); 8] {
 trait IntoF64 {
     fn into_f64(self) -> f64;
 }
+
 impl IntoF64 for i64 {
     fn into_f64(self) -> f64 {
         self as f64
     }
 }
+
 impl IntoF64 for f64 {
     fn into_f64(self) -> f64 {
         self
@@ -634,6 +826,28 @@ fn percent(difference: i64, baseline: i64) -> f64 {
         f64::NAN
     } else {
         difference as f64 / baseline as f64 * 100.0
+    }
+}
+
+fn perspective_summary(
+    core_name: &str,
+    other_name: &str,
+    core_total: i64,
+    other_total: i64,
+) -> String {
+    let difference = other_total - core_total;
+    if difference == 0 {
+        format!("{other_name} 与 {core_name} 总量相同")
+    } else if difference > 0 {
+        format!(
+            "{other_name} 比 {core_name} 多 {:.2}%，{core_name} 更节省 token",
+            percent(difference, core_total)
+        )
+    } else {
+        format!(
+            "{other_name} 比 {core_name} 少 {:.2}%，{core_name} 使用更多 token",
+            -percent(difference, core_total)
+        )
     }
 }
 
@@ -682,16 +896,32 @@ fn escape(value: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_dataset_spec() {
-        let spec: DatasetSpec = "short=a.parquet,b.parquet,c.parquet".parse().unwrap();
-        assert_eq!(spec.label, "short");
-        assert_eq!(spec.v32, PathBuf::from("b.parquet"));
+    fn args() -> Args {
+        Args {
+            tokenizers: vec![
+                "A=a_tokens".parse().unwrap(),
+                "B=b_tokens".parse().unwrap(),
+                "C=c_tokens".parse().unwrap(),
+            ],
+            datasets: vec!["short=a.parquet,b.parquet,c.parquet".parse().unwrap()],
+            primary: Some("C".to_owned()),
+            title: "test".to_owned(),
+            output: "test.md".into(),
+            group_col: None,
+            batch_size: 8,
+        }
     }
 
     #[test]
-    fn rejects_incomplete_dataset_spec() {
-        assert!("short=a.parquet,b.parquet".parse::<DatasetSpec>().is_err());
+    fn validates_dynamic_tokenizer_count_and_primary() {
+        assert_eq!(validate_args(&args()).unwrap(), 2);
+    }
+
+    #[test]
+    fn rejects_dataset_file_count_mismatch() {
+        let mut args = args();
+        args.datasets[0].paths.pop();
+        assert!(validate_args(&args).is_err());
     }
 
     #[test]
