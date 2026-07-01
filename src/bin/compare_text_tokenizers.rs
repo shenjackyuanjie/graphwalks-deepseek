@@ -116,7 +116,10 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     items.sort_by_key(|item| natural_path_key(Path::new(&item.path)));
 
-    let report = render_report(&args, &root, &items, primary);
+    let report = format!(
+        "{}\n",
+        render_report(&args, &root, &items, primary).trim_end()
+    );
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("无法创建报告目录: {}", parent.display()))?;

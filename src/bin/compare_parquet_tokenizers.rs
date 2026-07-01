@@ -106,7 +106,7 @@ fn main() -> Result<()> {
         bail!("输入数据集没有记录");
     }
 
-    let report = render_report(&args, &items, primary);
+    let report = format!("{}\n", render_report(&args, &items, primary).trim_end());
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("无法创建报告目录: {}", parent.display()))?;
