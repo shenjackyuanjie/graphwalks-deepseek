@@ -22,8 +22,8 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let file =
-        std::fs::File::open(&args.input).map_err(|e| anyhow!("无法打开文件 {}: {e}", args.input.display()))?;
+    let file = std::fs::File::open(&args.input)
+        .map_err(|e| anyhow!("无法打开文件 {}: {e}", args.input.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| anyhow!("无法读取 parquet: {e}"))?;
 
@@ -66,9 +66,12 @@ fn main() -> Result<()> {
 
     println!("problem_type 分布:");
     let mut sorted: Vec<_> = type_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|item| std::cmp::Reverse(item.1));
     for (pt, count) in &sorted {
-        println!("  {pt}: {count} ({:.2}%)", *count as f64 / total as f64 * 100.0);
+        println!(
+            "  {pt}: {count} ({:.2}%)",
+            *count as f64 / total as f64 * 100.0
+        );
     }
 
     // 打印前 5 条和后 5 条的 problem_type + token 数

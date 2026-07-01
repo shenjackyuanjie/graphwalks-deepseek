@@ -93,7 +93,7 @@ fn main() -> Result<()> {
 
     let mut files = Vec::new();
     collect_files(&root, &root, &extensions, &excludes, &mut files)?;
-    files.sort_by(|left, right| natural_path_key(left).cmp(&natural_path_key(right)));
+    files.sort_by_key(|path| natural_path_key(path));
     if files.is_empty() {
         bail!("没有找到符合条件的文本文件: {}", root.display());
     }
@@ -485,7 +485,7 @@ fn format_integer(value: usize) -> String {
     let digits = value.to_string();
     let mut output = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, character) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             output.push(',');
         }
         output.push(character);
