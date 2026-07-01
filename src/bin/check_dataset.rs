@@ -13,6 +13,10 @@ struct Args {
     /// 输入的 parquet 文件。
     #[arg(short, long)]
     input: PathBuf,
+
+    /// 要检查的 token 数列。
+    #[arg(long, default_value = "deepseek_v4_input_tokens")]
+    token_col: String,
 }
 
 fn main() -> Result<()> {
@@ -27,7 +31,7 @@ fn main() -> Result<()> {
     let problem_type_idx = schema
         .index_of("problem_type")
         .map_err(|_| anyhow!("缺少 'problem_type' 列"))?;
-    let token_idx = schema.index_of("deepseek_v4_input_tokens").ok();
+    let token_idx = schema.index_of(&args.token_col).ok();
 
     let reader = builder.with_batch_size(64).build()?;
 
