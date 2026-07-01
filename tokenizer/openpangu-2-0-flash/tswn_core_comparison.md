@@ -7,6 +7,7 @@
 | 输入目录 | `\\?\D:\githubs\namer\tswn-core\crates\tswn_core\src` |
 | 文件数 | 116 |
 | Tokenizer 数 | 3 |
+| 分块汇总 | 关闭 |
 | 主对比 tokenizer | OpenPangu |
 | 编码方式 | `Tokenizer::encode(text, false)`，不添加 special tokens |
 | OpenPangu tokenizer | `tokenizer/openpangu-2-0-flash/tokenizer.json` |
@@ -277,4 +278,3 @@
 | `player/test/skills.rs` | 55,152 | 14,408 | 15,372 | 13,856 | 1.06691x | 0.96169x |
 | `player/test/states.rs` | 8,694 | 2,324 | 2,928 | 2,256 | 1.25990x | 0.97074x |
 | `player/test/weapons.rs` | 1,382 | 463 | 544 | 432 | 1.17495x | 0.93305x |
-
